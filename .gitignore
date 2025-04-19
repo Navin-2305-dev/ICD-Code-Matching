@@ -1,0 +1,8 @@
+
+__pycache__/
+.venv/
+icd_matcher.log
+
+*.pyc
+*.pyo
+*.pyd

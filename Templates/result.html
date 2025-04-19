@@ -1,0 +1,10 @@
+{% extends 'base.html' %}
+{% block content %}
+    <h1>Patient Summary</h1>
+    <p>{{ result.summary }}</p>
+    <h2>Predefined ICD Codes</h2>
+    <pre>{{ result.predefined_icd }}</pre>
+    <h2>Computed ICD Codes</h2>
+    <pre>{{ result.computed_icd }}</pre>
+    <p><a href="{% url 'patient_input' %}">Enter Another Patient</a></p>
+{% endblock %}
