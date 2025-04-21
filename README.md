@@ -1,4 +1,4 @@
-# 💡 ICD Code Matching - Intelligent Medical Mapping with Django & NLP 🧠
+# 💡 ICD Code Matching - Intelligent Medical Mapping with Django & NLP 
 
 A powerful Django-based web application that automates the process of mapping medical remarks to ICD-10 codes using state-of-the-art NLP and semantic search. Built with Django, Django Ninja, sentence-transformers, and optional Mistral LLM integration.
 
@@ -21,22 +21,24 @@ A powerful Django-based web application that automates the process of mapping me
 - SQLite (FTS5-enabled)
 - Mistral LLM (optional, for enhanced confidence scoring)
 - NumPy, Requests, Tenacity
-- `uv` (ultra fast Python package manager)
+- `uv` (Python package manager)
 
 ────────────────────────────────────────────────────────────────────────────
 
 ## 🚀 Getting Started
 
 # Step 1: Clone the repository
-$ git clone https://github.com/your-username/icd_code_matching.git
+$ git clone https://gitlab.com/program_aum/computation/icd_cleaning_tools.git
 
-$ cd icd_code_matching
+$ cd MedWise Project - 114
 
 # Step 2: Create virtual environment using uv
 $ uv venv
 
 # Step 3: Activate the virtual environment
-$ source .venv/bin/activate   # (or .venv\Scripts\activate on Windows)
+$ source .venv/bin/activate   (Mac)
+
+$ source .venv\Scripts\activate  (Windows)
 
 # Step 4: Install dependencies
 $ uv pip install --requirements requirements.txt
@@ -85,17 +87,6 @@ All remarks are processed, embedded, and semantically matched to the nearest ICD
 
 ────────────────────────────────────────────────────────────────────────────
 
-## 🧪 Example Output
-
-🔸 Summary:
-"The patient was suffering from acute gastroenteritis and dehydration."
-
-🔸 Suggested ICD Codes:
-- A09: Infectious gastroenteritis (92.1%)
-- E86.0: Dehydration (89.3%)
-
-────────────────────────────────────────────────────────────────────────────
-
 ## 🔧 Developer Notes
 
 - Core logic resides in `utils.py`
@@ -109,11 +100,11 @@ All remarks are processed, embedded, and semantically matched to the nearest ICD
 
 # Run FTS table setup manually (optional)
 $ python manage.py shell
->>> from icd_matcher.utils import setup_fts_table
+> from icd_matcher.utils import setup_fts_table
 
->>> setup_fts_table()
+> setup_fts_table()
 
 # Clear cached embeddings (dev mode)
->>> from icd_matcher.utils import clear_embedding_cache
+> from icd_matcher.utils import clear_embedding_cache
 
->>> clear_embedding_cache()
+> clear_embedding_cache()
