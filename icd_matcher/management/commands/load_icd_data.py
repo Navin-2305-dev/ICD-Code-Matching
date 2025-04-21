@@ -8,7 +8,7 @@ class Command(BaseCommand):
     help = 'Load ICD-10 codes from JSON file into the database'
 
     def add_arguments(self, parser):
-        parser.add_argument('json_file', type=str, help='D:/MedWise Project - 114/icd_10/icd_version_2019.json')
+        parser.add_argument('json_file', type=str, help='icd_10\icd_version_2019.json')
 
     def expand_range(self, code_range, base_title):
         """Expand a range like W00-W19 into individual codes, only if same letter prefix."""

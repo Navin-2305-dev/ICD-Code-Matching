@@ -362,7 +362,7 @@ def find_best_icd_match(
     use_parallel: bool = True
 ) -> Dict[str, List[Tuple[str, str, float]]]:
     """
-    Find the best matching ICD codes for given medical conditions with parallel processing
+    Find all matching ICD codes for given medical conditions with parallel processing
     """
     if not conditions:
         logger.warning("No conditions provided.")
@@ -459,7 +459,7 @@ def _process_single_condition(
     patient_data: str,
     status_words: Set[str]
 ) -> List[Tuple[str, str, float]]:
-    """Process a single condition for ICD matching"""
+    """Process a single condition to find all matching ICD codes"""
     logger.info(f"Processing condition: {original_condition}")
     
     # Remove status words for better matching
@@ -539,7 +539,7 @@ def _process_single_condition(
                 condition_embedding_reshaped = condition_embedding.reshape(1, -1)
                 similarities = np.dot(match_embeddings, condition_embedding_reshaped.T).flatten()
                 
-                # Calculate similarity scores
+                # Calculate similarity scores for all matches above threshold
                 similarity_scores = [
                     (matches[i].code, matches[i].title, max(50, min(95, (sim + 1) * 50)))
                     for i, sim in enumerate(similarities)
@@ -552,25 +552,26 @@ def _process_single_condition(
             except Exception as e:
                 logger.error(f"Similarity calculation failed: {e}")
                 # Fallback to basic matching
-                similarity_scores = [(m.code, m.title, 60.0) for m in matches[:3]]
+                similarity_scores = [(m.code, m.title, 60.0) for m in matches]
             
             if not similarity_scores:
                 logger.warning(f"No similarity matches for '{original_condition}'.")
                 return [(fts_results[0][0], get_icd_title(fts_results[0][0]), 60.0)] if fts_results else []
             
-            # Take top matches for Mistral
-            candidate_list = similarity_scores[:20]
+            # Use all candidates for Mistral
+            candidate_list = similarity_scores
             candidate_text = "\n".join([f"{code}: {title} ({score:.1f}%)" for code, title, score in candidate_list])
             
             # Use Mistral for refinement if available
             try:
                 prompt = (
                     f"Analyze the patient's medical data and the clinical condition: '{original_condition}'.\n\n"
-                    f"Your task is to select *all appropriately matching ICD-10 codes* from the candidate list below that best match the given patient condition and data, "
+                    f"Your task is to select *all clinically relevant ICD-10 codes* from the candidate list below that match the given patient condition and data, "
                     f"based on clinical relevance and context. Ensure to:\n"
+                    f"- Include all codes that are appropriate for the condition and supported by the medical data.\n"
                     f"- Exclude any negated conditions.\n"
                     f"- Prioritize codes from the candidate list.\n"
-                    f"- You may suggest additional ICD-10 codes only if they are clearly supported by the patient's medical data.\n\n"
+                    f"- You may suggest additional ICD-10 codes only if they are clairement supported by the patient's medical data.\n"
                     f"Return the results in the following format, one per line:\n"
                     f"[icd_code]: icd_title (X%)\n"
                     f"Where 'X' is your confidence level (0 to 100) based on how well the code matches the condition and context.\n"
@@ -580,6 +581,8 @@ def _process_single_condition(
                 )
                 
                 mistral_response = query_mistral(prompt)
+                print(f"Prompt sent to Mistral: {prompt}...")
+                print(mistral_response)
                 logger.debug(f"Mistral response for '{original_condition}': {mistral_response[:100]}...")
                 
                 matched_codes = []
@@ -606,16 +609,16 @@ def _process_single_condition(
                 
                 final_matches = list(matched_codes_dict.values())
                 
-                # Return Mistral's results if available, otherwise top similarity scores
+                # Return Mistral's results if available, otherwise all similarity scores
                 if final_matches:
-                    return final_matches
+                    return sorted(final_matches, key=lambda x: x[2], reverse=True)
                 
             except Exception as e:
                 logger.error(f"Mistral refinement failed for '{original_condition}': {e}")
             
-            # Return top similarity scores as fallback
+            # Return all similarity scores as fallback
             return [(code, title, score) 
-                    for code, title, score in sorted(similarity_scores, key=lambda x: x[2], reverse=True)[:3]]
+                    for code, title, score in sorted(similarity_scores, key=lambda x: x[2], reverse=True)]
                     
         except Exception as e:
             logger.error(f"Error processing matches for '{original_condition}': {e}")

@@ -13,19 +13,12 @@ def get_icd_title(code):
         icd_entry = ICDCategory.objects.get(code=code)
         return icd_entry.title
     except ICDCategory.DoesNotExist:
-        # Fallback to a placeholder or extract from expected matches if needed
         return f"Title for {code}"
 
 def run():
-    """
-    Process training data to match ICD codes, producing a single row per patient.
-    Outputs a CSV with all training data columns and matched ICD codes with titles and percentages.
-    """
 
-    # Path to training data (defined in settings.py)
     data_path = getattr(settings, 'TRAINING_DATA_PATH', 'Training_dataset.csv')
     
-    # Read training data
     try:
         df = pd.read_csv(data_path)
         logger.info(f"Loaded training data from {data_path} with {len(df)} records.")
@@ -39,17 +32,14 @@ def run():
         logger.error(f"Error reading training data: {e}")
         return
 
-    # Validate required columns
     expected_columns = ['DISCHARGE_REMARKS', 'ICD_REMARKS_A', 'ICD_REMARKS_D', 
                        'Predefined ICD_code', 'Generated Matching ICD Code(s)']
     if not all(col in df.columns for col in expected_columns):
         logger.error(f"Training data must contain columns: {expected_columns}")
         return
 
-    # Initialize output list
     results = []
 
-    # Process each row
     for index, row in df.iterrows():
         try:
             discharge_remarks = row['DISCHARGE_REMARKS']
@@ -58,39 +48,30 @@ def run():
             predefined_icd = row['Predefined ICD_code']
             expected_matches = row['Generated Matching ICD Code(s)']
 
-            # Combine remarks for condition extraction
             medical_text = f"{discharge_remarks} {icd_remarks_a} {icd_remarks_d}"
 
-            # Generate patient summary and extract conditions
             summary, conditions = generate_patient_summary(medical_text)
             logger.debug(f"Row {index}: Summary: {summary}, Conditions: {conditions}")
 
-            # Initialize matches list for this row
             matched_codes = []
 
-            # Skip if no valid conditions
             if not conditions or all(c.lower() == "no conditions identified" for c in conditions):
                 logger.info(f"Row {index}: No valid conditions found for: {medical_text}")
                 matched_codes.append("None (0.0%)")
             else:
-                # Find best ICD matches
                 icd_matches = find_best_icd_match(conditions, medical_text)
                 logger.debug(f"Row {index}: ICD Matches: {icd_matches}")
 
-                # Aggregate matches
                 for condition, matches in icd_matches.items():
                     if not matches:
                         logger.info(f"Row {index}: No ICD matches for condition: {condition}")
                         continue
 
                     for code, score in matches:
-                        # Get ICD title
                         title = get_icd_title(code)
-                        # Format match
                         match_str = f"{code}: {title} ({score:.1f}%)"
                         matched_codes.append(match_str)
 
-                        # Save to database
                         ICDCategory.objects.update_or_create(
                             code=code,
                             defaults={
@@ -105,10 +86,8 @@ def run():
                             f"Expected Matches: {expected_matches}"
                         )
 
-            # Format matched codes as a comma-separated string
             matched_codes_str = ", ".join(matched_codes) if matched_codes else "None (0.0%)"
 
-            # Append to results
             results.append({
                 'DISCHARGE_REMARKS': discharge_remarks,
                 'ICD_REMARKS_A': icd_remarks_a,
@@ -131,7 +110,6 @@ def run():
             print(results)
             continue
 
-    # Save results to CSV
     try:
         output_df = pd.DataFrame(results)
         output_df.to_csv('Sample_output.csv', index=False)

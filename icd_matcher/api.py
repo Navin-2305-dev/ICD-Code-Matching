@@ -4,7 +4,6 @@ from typing import Dict, List, Tuple, Optional
 from datetime import date
 from pydantic import Field, validator
 import logging
-
 from .utils import (
     generate_patient_summary,
     find_best_icd_match,
@@ -14,17 +13,14 @@ from .utils import (
 )
 from .models import ICDCategory
 
-# Configure logging
 logger = logging.getLogger(__name__)
 
-# Initialize the API
 api = NinjaAPI(
     title="ICD Code Matcher API",
     description="API for matching patient descriptions to ICD-10 codes",
     version="1.0.0"
 )
 
-# Input schemas
 class PatientInput(Schema):
     admission_date: date
     admission_type: str
@@ -38,7 +34,6 @@ class ICDCodeQuery(Schema):
     medical_text: str = Field(..., description="Patient medical description")
     existing_codes: List[str] = Field(default=[], description="Existing ICD codes")
 
-# Output schemas
 class ICDMatch(Schema):
     code: Optional[str] = None
     title: Optional[str] = None
@@ -64,12 +59,8 @@ class ICDCodeSearchResponse(Schema):
     parent_code: Optional[str] = None
     parent_title: Optional[str] = None
 
-# Endpoints
 @api.post("/match-patient", response=PatientSummaryResponse, tags=["ICD Matching"])
 def match_patient(request, data: PatientInput):
-    """
-    Process patient information and return matching ICD-10 codes
-    """
     try:
         patient_text = (
             f"A: {data.icd_remarks_admission}\n"
@@ -86,7 +77,6 @@ def match_patient(request, data: PatientInput):
             key=len, reverse=True
         )
 
-        # Call the matching function
         patient_codes = find_best_icd_match(
             non_negated_conditions,
             patient_text,
@@ -97,7 +87,7 @@ def match_patient(request, data: PatientInput):
         for condition, matches in patient_codes.items():
             condition_matches = []
             for code, title, score in matches:
-                if code and score >= 60:  # Relaxed threshold
+                if code and score >= 60:
                     condition_matches.append(ICDMatch(code=code, title=get_icd_title(code), confidence=score))
                 else:
                     condition_matches.append(ICDMatch(code=None, title=None, confidence=0))
@@ -116,9 +106,6 @@ def match_patient(request, data: PatientInput):
 
 @api.post("/match-text", response=List[ConditionMatch], tags=["ICD Matching"])
 def match_medical_text(request, data: ICDCodeQuery):
-    """
-    Match ICD-10 codes from raw medical text
-    """
     try:
         processed_text = preprocess_text(data.medical_text)
         summary, conditions = generate_patient_summary(processed_text)
@@ -139,7 +126,7 @@ def match_medical_text(request, data: ICDCodeQuery):
         for condition, code_matches in matches.items():
             condition_matches = []
             for code, title, confidence in code_matches:
-                if code and confidence >= 60:  # Relaxed threshold
+                if code and confidence >= 60:
                     condition_matches.append(ICDMatch(code=code, title=get_icd_title(code), confidence=confidence))
                 else:
                     condition_matches.append(ICDMatch(code=None, title=None, confidence=0))
@@ -153,9 +140,6 @@ def match_medical_text(request, data: ICDCodeQuery):
 
 @api.get("/search-icd", response=List[ICDCodeSearchResponse], tags=["ICD Search"])
 def search_icd_codes(request, query: str, limit: int = 20):
-    """
-    Search for ICD-10 codes by description
-    """
     try:
         query = preprocess_text(query)
         results = []
@@ -188,9 +172,6 @@ def search_icd_codes(request, query: str, limit: int = 20):
 
 @api.get("/icd/{code}", response=ICDCodeSearchResponse, tags=["ICD Search"])
 def get_icd_code(request, code: str):
-    """
-    Get details for a specific ICD-10 code
-    """
     try:
         icd_entry = ICDCategory.objects.filter(code=code).select_related('parent').first()
         if not icd_entry:

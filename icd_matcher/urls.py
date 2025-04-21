@@ -4,7 +4,7 @@ from . import views
 from .api import api
 
 urlpatterns = [
-    # Traditional Django views
+    # Django views
     path('', views.patient_input, name='patient_input'),
     path('result/', views.result, name='result'),
     path('search/', views.search_icd, name='search_icd'),

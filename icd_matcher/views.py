@@ -3,7 +3,6 @@ from django.shortcuts import render
 from django.http import JsonResponse
 from django.views.decorators.http import require_http_methods
 import logging
-
 from .forms import PatientInputForm
 from .utils import (
     generate_patient_summary,
@@ -14,17 +13,15 @@ from .utils import (
 )
 from .models import ICDCategory
 
-# Setup logger
 logger = logging.getLogger(__name__)
 
+# Handles patient data
 @require_http_methods(["GET", "POST"])
 def patient_input(request):
-    """Handles patient data submission and ICD matching"""
     if request.method == 'POST':
         form = PatientInputForm(request.POST)
         if form.is_valid():
             try:
-                # Prepare patient text from form
                 patient_text = _format_patient_text(form.cleaned_data)
                 corrected_text = preprocess_text(patient_text)
 
@@ -63,9 +60,9 @@ def patient_input(request):
 
     return render(request, 'input_form.html', {'form': PatientInputForm()})
 
+# Search for ICD codes using FTS
 @require_http_methods(["GET"])
 def search_icd(request):
-    """Search for ICD codes using full-text search"""
     query = request.GET.get('q', '').strip()
     limit = int(request.GET.get('limit', 20))
 
@@ -88,14 +85,13 @@ def search_icd(request):
         logger.exception("Error searching ICD codes")
         return JsonResponse({'error': 'An error occurred during search'}, status=500)
 
+# Result page
 def result(request):
-    """Direct view to result page (if needed)"""
+    
     return render(request, 'result.html')
 
-# ----------------- Helper Functions ----------------- #
-
+# Fetch ICD entries along with their parent categories
 def _fetch_icd_entries_with_parent(codes):
-    """Fetch ICD entries along with their parent categories"""
     entries = []
     for code in codes:
         entry = ICDCategory.objects.filter(code=code).first()
@@ -108,8 +104,8 @@ def _fetch_icd_entries_with_parent(codes):
             })
     return entries
 
+# Format patient text
 def _format_patient_text(data):
-    """Format patient remarks and admission details into a string"""
     return (
         f"A: {data['ICD_REMARKS_A']}\n"
         f"D: {data['ICD_REMARKS_D']} - {data['DISCHARGE_WARD']} - "
@@ -118,7 +114,6 @@ def _format_patient_text(data):
     )
 
 def _process_predefined_codes(data):
-    """Prepare predefined ICD codes and descriptions"""
     code = data.get('predefined_icd_code')
     codes = [code] if code else []
     icd_descriptions = []
@@ -130,7 +125,6 @@ def _process_predefined_codes(data):
     return icd_descriptions or ["No predefined ICD codes"], codes
 
 def _compute_icd_matches(conditions, text, existing_codes):
-    """Find the best ICD matches and group by ICD code, returning structured results"""
     matches = find_best_icd_match(conditions, text, existing_codes)
     icd_to_conditions = {}
     icd_to_score = {}
@@ -138,7 +132,7 @@ def _compute_icd_matches(conditions, text, existing_codes):
 
     for cond, code_scores in matches.items():
         for code, title, score in code_scores:
-            if code and score >= 60:  # Relaxed threshold
+            if code and score >= 60:
                 icd_to_conditions.setdefault(code, []).append(cond)
                 icd_to_score[code] = max(icd_to_score.get(code, 0), score)
                 icd_to_title[code] = title

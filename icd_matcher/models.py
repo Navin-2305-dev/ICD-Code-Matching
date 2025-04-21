@@ -11,4 +11,4 @@ class ICDCategory(models.Model):
         return f"{self.code} - {self.title}"
 
     class Meta:
-        indexes = [models.Index(fields=['code'])]  # Index for faster lookups
+        indexes = [models.Index(fields=['code'])]
