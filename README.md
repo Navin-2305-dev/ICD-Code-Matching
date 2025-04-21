@@ -2,7 +2,7 @@
 
 A powerful Django-based web application that automates the process of mapping medical remarks to ICD-10 codes using state-of-the-art NLP and semantic search. Built with Django, Django Ninja, sentence-transformers, and optional Mistral LLM integration.
 
-────────────────────────────────────────────────────────────────────────────
+--- 
 
 ## 📦 Project Highlights
 
@@ -12,7 +12,7 @@ A powerful Django-based web application that automates the process of mapping me
 ✔️ Fast API access using Django-Ninja  
 ✔️ Ready-to-run with a web interface for demo/testing  
 
-────────────────────────────────────────────────────────────────────────────
+---
 
 ## 🧱 Tech Stack
 
@@ -23,7 +23,7 @@ A powerful Django-based web application that automates the process of mapping me
 - NumPy, Requests, Tenacity
 - `uv` (Python package manager)
 
-────────────────────────────────────────────────────────────────────────────
+---
 
 ## 🚀 Getting Started
 
@@ -59,8 +59,7 @@ $ python manage.py runscript process_icd_data
 # Step 8: (API Test) Open Django-Ninja API docs
 http://127.0.0.1:8000/api/docs
 
-────────────────────────────────────────────────────────────────────────────
-
+---
 ## 📂 Input Fields
 
 This project expects the following fields for each patient record:
@@ -73,7 +72,7 @@ This project expects the following fields for each patient record:
 
 All remarks are processed, embedded, and semantically matched to the nearest ICD codes.
 
-────────────────────────────────────────────────────────────────────────────
+---
 
 ## 🧠 Features
 
@@ -85,7 +84,7 @@ All remarks are processed, embedded, and semantically matched to the nearest ICD
 - 🧬 Parallelized condition matching for speed
 - 📡 Lightweight and fast API access (Django-Ninja)
 
-────────────────────────────────────────────────────────────────────────────
+---
 
 ## 🔧 Developer Notes
 
@@ -94,7 +93,7 @@ All remarks are processed, embedded, and semantically matched to the nearest ICD
 - Embedding caching and ORM fallback included
 - FTS5-backed `icd_fts` virtual table is auto-created
 
-────────────────────────────────────────────────────────────────────────────
+---
 
 ## 🛠️ Useful Commands
 
