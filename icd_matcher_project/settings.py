@@ -1,17 +1,10 @@
-
 import os
 from pathlib import Path
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-
-# Quick-start development settings - unsuitable for production
-# See https://docs.djangoproject.com/en/5.1/howto/deployment/checklist/
-
 SECRET_KEY = 'django-insecure-46w1zzvshb#9=z+0csj6em+y)$(g#bj+qz^334*t92&cdaub+2'
-
 DEBUG = True
-
 ALLOWED_HOSTS = ['*']
 
 INSTALLED_APPS = [
@@ -22,30 +15,34 @@ INSTALLED_APPS = [
     'django.contrib.messages',
     'django.contrib.staticfiles',
     'django_extensions',
+    'jsonfield',
     'icd_matcher',
 ]
 
 CACHES = {
     'default': {
         'BACKEND': 'django.core.cache.backends.filebased.FileBasedCache',
-        'LOCATION': '/var/tmp/django_cache',
+        'LOCATION': os.path.join(BASE_DIR, 'cache'),
     }
 }
 
-
-LOGGING = {
-    'version': 1,
-    'disable_existing_loggers': False,
-    'handlers': {
-        'console': {'class': 'logging.StreamHandler'},
-        'file': {'class': 'logging.FileHandler', 'filename': 'icd_matcher.log'},
-    },
-    'loggers': {
-        'icd_matcher': {
-            'handlers': ['console', 'file'],
-            'level': 'INFO',
-        },
-    },
+ICD_MATCHING_SETTINGS = {
+    'CACHE_TTL': 3600,
+    'BATCH_SIZE': 32,
+    'MAX_WORKERS': 4,
+    'MIN_SIMILARITY_SCORE': 70.0,
+    'MAX_SIMILARITY_SCORE': 100.0,
+    'FTS_QUERY_LIMIT': 25,
+    'MAX_CANDIDATES': 25,
+    'INCLUSION_BOOST': 1.1,
+    'EXCLUSION_PENALTY': 0.5,
+    'NEGATION_WINDOW': 5,
+    'NEGATION_CUES': [
+        "no", "not", "denies", "negative", "without", "absent", "ruled out", 
+        "non", "never", "lacks", "excludes", "rules out", "negative for", 
+        "free of", "deny", "denying", "unremarkable for"
+    ],
+    'MISTRAL_API_URL': "http://localhost:11434/api/generate",
 }
 
 MIDDLEWARE = [
@@ -63,7 +60,7 @@ ROOT_URLCONF = 'icd_matcher_project.urls'
 TEMPLATES = [
     {
         'BACKEND': 'django.template.backends.django.DjangoTemplates',
-        'DIRS': [BASE_DIR +'/templates'],
+        'DIRS': [os.path.join(BASE_DIR, 'templates')],
         'APP_DIRS': True,
         'OPTIONS': {
             'context_processors': [
@@ -79,20 +76,12 @@ TEMPLATES = [
 WSGI_APPLICATION = 'icd_matcher_project.wsgi.application'
 ASGI_APPLICATION = "icd_matcher_project.asgi.application"
 
-
-# Database
-# https://docs.djangoproject.com/en/5.1/ref/settings/#databases
-
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.sqlite3',
         'NAME': os.path.join(BASE_DIR, 'db.sqlite3'),
     }
 }
-
-
-# Password validation
-# https://docs.djangoproject.com/en/5.1/ref/settings/#auth-password-validators
 
 AUTH_PASSWORD_VALIDATORS = [
     {
@@ -109,27 +98,23 @@ AUTH_PASSWORD_VALIDATORS = [
     },
 ]
 
-
-# Internationalization
-# https://docs.djangoproject.com/en/5.1/topics/i18n/
-
 LANGUAGE_CODE = 'en-us'
-
 TIME_ZONE = 'UTC'
-
 USE_I18N = True
-
 USE_TZ = True
 
-
-# Static files (CSS, JavaScript, Images)
-# https://docs.djangoproject.com/en/5.1/howto/static-files/
-
 STATIC_URL = '/static/'
-STATICFILES_DIRS = [BASE_DIR +'/static']
-STATIC_ROOT = BASE_DIR + '/staticfiles'
-
-# Default primary key field type
-# https://docs.djangoproject.com/en/5.1/ref/settings/#default-auto-field
+STATICFILES_DIRS = [os.path.join(BASE_DIR, 'static')]
+STATIC_ROOT = os.path.join(BASE_DIR, 'staticfiles')
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+
+# Celery Configuration
+CELERY_BROKER_URL = 'redis://localhost:6379/0'
+CELERY_RESULT_BACKEND = 'redis://localhost:6379/0'
+CELERY_ACCEPT_CONTENT = ['json']
+CELERY_TASK_SERIALIZER = 'json'
+CELERY_RESULT_SERIALIZER = 'json'
+CELERY_TIMEZONE = 'UTC'
+CELERY_TASK_TRACK_STARTED = True
+CELERY_TASK_TIME_LIMIT = 30 * 60

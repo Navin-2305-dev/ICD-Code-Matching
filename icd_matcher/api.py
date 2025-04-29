@@ -4,12 +4,10 @@ from typing import Dict, List, Tuple, Optional
 from datetime import date
 from pydantic import Field, validator
 import logging
-from .utils import (
-    generate_patient_summary,
+from .utils.text_processing import generate_patient_summary, get_negation_cues, is_not_negated
+from .utils.embeddings import (
     find_best_icd_match,
-    preprocess_text,
-    get_negation_cues,
-    is_not_negated
+    preprocess_text
 )
 from .models import ICDCategory
 
@@ -179,6 +177,7 @@ def get_icd_code(request, code: str):
                 request,
                 {"message": f"ICD code {code} not found"},
                 status=404
+                
             )
 
         parent_code = icd_entry.parent.code if icd_entry.parent else None

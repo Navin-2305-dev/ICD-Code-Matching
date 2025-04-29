@@ -4,20 +4,16 @@ from django.http import JsonResponse
 from django.views.decorators.http import require_http_methods
 import logging
 from .forms import PatientInputForm
-from .utils import (
-    generate_patient_summary,
-    find_best_icd_match,
-    preprocess_text,
-    get_negation_cues,
-    is_not_negated
-)
+from .utils.text_processing import generate_patient_summary, get_negation_cues, is_not_negated
+from .utils.embeddings import find_best_icd_match, preprocess_text
 from .models import ICDCategory
+from icd_matcher.utils.exceptions import PatientInputProcessingError, ICDSearchError
 
 logger = logging.getLogger(__name__)
 
-# Handles patient data
 @require_http_methods(["GET", "POST"])
 def patient_input(request):
+    """Handle patient data input and compute ICD matches."""
     if request.method == 'POST':
         form = PatientInputForm(request.POST)
         if form.is_valid():
@@ -53,16 +49,16 @@ def patient_input(request):
                 return render(request, 'result.html', {'result': result})
 
             except Exception as e:
-                logger.exception("Error processing patient data")
-                return render(request, 'error.html', {'error': "An error occurred processing the patient data."})
+                logger.exception(f"Error processing patient data: {e}")
+                raise PatientInputProcessingError(f"Error processing patient data: {e}")
         else:
             return render(request, 'input_form.html', {'form': form, 'errors': form.errors})
 
     return render(request, 'input_form.html', {'form': PatientInputForm()})
 
-# Search for ICD codes using FTS
 @require_http_methods(["GET"])
 def search_icd(request):
+    """Search for ICD codes using FTS."""
     query = request.GET.get('q', '').strip()
     limit = int(request.GET.get('limit', 20))
 
@@ -82,16 +78,15 @@ def search_icd(request):
         return JsonResponse({'results': results})
 
     except Exception as e:
-        logger.exception("Error searching ICD codes")
-        return JsonResponse({'error': 'An error occurred during search'}, status=500)
+        logger.exception(f"Error searching ICD codes: {e}")
+        raise ICDSearchError(f"Error searching ICD codes: {e}")
 
-# Result page
 def result(request):
-    
+    """Render the result page."""
     return render(request, 'result.html')
 
-# Fetch ICD entries along with their parent categories
 def _fetch_icd_entries_with_parent(codes):
+    """Fetch ICD entries along with their parent categories."""
     entries = []
     for code in codes:
         entry = ICDCategory.objects.filter(code=code).first()
@@ -104,8 +99,8 @@ def _fetch_icd_entries_with_parent(codes):
             })
     return entries
 
-# Format patient text
 def _format_patient_text(data):
+    """Format patient text from form data."""
     return (
         f"A: {data['ICD_REMARKS_A']}\n"
         f"D: {data['ICD_REMARKS_D']} - {data['DISCHARGE_WARD']} - "
@@ -114,6 +109,7 @@ def _format_patient_text(data):
     )
 
 def _process_predefined_codes(data):
+    """Process predefined ICD codes from form data."""
     code = data.get('predefined_icd_code')
     codes = [code] if code else []
     icd_descriptions = []
@@ -125,6 +121,7 @@ def _process_predefined_codes(data):
     return icd_descriptions or ["No predefined ICD codes"], codes
 
 def _compute_icd_matches(conditions, text, existing_codes):
+    """Compute ICD matches for conditions."""
     matches = find_best_icd_match(conditions, text, existing_codes)
     icd_to_conditions = {}
     icd_to_score = {}

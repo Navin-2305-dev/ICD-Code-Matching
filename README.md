@@ -30,8 +30,6 @@ A powerful Django-based web application that automates the process of mapping me
 # Step 1: Clone the repository
 $ git clone https://gitlab.com/program_aum/computation/icd_cleaning_tools.git
 
-$ cd MedWise Project - 114
-
 # Step 2: Create virtual environment using uv
 $ uv venv
 
@@ -48,7 +46,7 @@ $ python manage.py makemigrations
 
 $ python manage.py migrate
 
-$ python manage.py load_icd_data "icd_10\icd_version_2019.json"
+$ python manage.py load_icd_data icd_version_2019.json
 
 # Step 6: Run the development server
 $ python manage.py runserver

@@ -1,31 +1,25 @@
-# icd_matcher/utils.py
-import os
+# For Refernce
 import re
 import logging
 import functools
-import contextlib
 from typing import List, Tuple, Dict, Optional, Union, Any, Set
 import numpy as np
 import requests
 from django.db import connection, transaction
-from django.db.models import Q, F, Value
+from django.db.models import Q
 from django.db.models.functions import Length
 from sentence_transformers import SentenceTransformer
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 import concurrent.futures
 from functools import lru_cache
-
 from icd_matcher.models import ICDCategory
 
-# Configure logging
 logger = logging.getLogger(__name__)
 
-# Global cache for embeddings and titles
 EMBEDDING_CACHE = {}
 TITLE_EMBEDDING_CACHE = {}
 ICD_TITLE_CACHE = {}
 
-# Initialize sentence transformer model with lazy loading
 @functools.lru_cache(maxsize=1)
 def get_embedder():
     """Lazily load the sentence transformer model only when needed"""
@@ -35,7 +29,6 @@ def get_embedder():
         logger.error(f"Failed to load sentence transformer model: {e}")
         return None
 
-# Function to safely access embedder with error handling
 def get_sentence_embedder():
     """Get the sentence embedder with error handling"""
     try:
@@ -45,17 +38,15 @@ def get_sentence_embedder():
         return embedder
     except Exception as e:
         logger.error(f"Error accessing sentence transformer model: {e}")
-        # Return a dummy embedder for graceful degradation
         class DummyEmbedder:
             def encode(self, sentences, **kwargs):
                 if isinstance(sentences, str):
-                    return np.zeros(384)  # Default embedding size
+                    return np.zeros(384)
                 return np.zeros((len(sentences), 384))
         return DummyEmbedder()
 
 # Setup FTS5 table for ICD lookup
 def setup_fts_table():
-    """Create or rebuild the FTS5 table for efficient ICD code lookup"""
     logger.info("Setting up FTS5 table for ICD matching")
     with connection.cursor() as cursor:
         # Drop existing FTS table if it exists
@@ -101,7 +92,6 @@ def setup_fts_table():
     logger.info("FTS5 table setup complete")
 
 def clear_embedding_cache():
-    """Clear the embedding cache to free memory"""
     global EMBEDDING_CACHE, TITLE_EMBEDDING_CACHE, ICD_TITLE_CACHE
     EMBEDDING_CACHE.clear()
     TITLE_EMBEDDING_CACHE.clear()
@@ -109,34 +99,25 @@ def clear_embedding_cache():
     logger.info("Embedding cache cleared")
 
 def preprocess_text(text: str) -> str:
-    """Preprocess text by lowercasing and standardizing format"""
     if not isinstance(text, str):
         return ""
     
-    # Basic preprocessing
     text = text.lower().strip()
-    
-    # Standardize spacing
     text = re.sub(r'\s+', ' ', text)
-    
-    # Standardize punctuation
     text = re.sub(r'[,.;:!?](?!\d)', ' ', text)
-    
     return text
 
+# Getting negated cues 
 @lru_cache(maxsize=1)
 def get_negation_cues() -> List[str]:
-    """Return a cached list of common medical negation cues"""
     return [
         "no", "not", "denies", "negative", "without", "absent", "ruled out", 
         "non", "never", "lacks", "excludes", "rules out", "negative for", 
         "free of", "deny", "denying", "unremarkable for"
     ]
 
+# Matching negated terms
 def is_not_negated(condition: str, text: str, negation_cues: Optional[List[str]] = None, window: int = 8) -> bool:
-    """
-    Check if a condition is not negated in the given text with optimized regex
-    """
     if not condition or not text:
         return True
     
@@ -158,17 +139,16 @@ def is_not_negated(condition: str, text: str, negation_cues: Optional[List[str]]
         if re.search(pattern, text_lower):
             return False
     
-    # Check for window-based negation more efficiently
+    # Check for window-based negation
     matches = list(re.finditer(rf'\b{re.escape(condition_lower)}\b', text_lower))
     if not matches:
         return True
     
     for match in matches:
         start_idx = match.start()
-        context_start = max(0, start_idx - 50)  # Use character window instead of word window
+        context_start = max(0, start_idx - 50)
         preceding_context = text_lower[context_start:start_idx]
         
-        # Check for negation cues in preceding context
         if not any(cue in preceding_context.split() for cue in negation_cues):
             return True
     
@@ -203,10 +183,8 @@ def query_mistral(prompt: str, max_retries: int = 3) -> str:
         logger.error(f"Unexpected error in Mistral query: {e}")
         return ""
 
+# Generate patient summary and extract conditions
 def generate_patient_summary(patient_text: str) -> Tuple[str, List[str]]:
-    """
-    Generate a concise summary of patient conditions from medical text with improved robustness
-    """
     if not patient_text or not isinstance(patient_text, str):
         return "No patient data provided.", ["No conditions identified"]
     
@@ -227,10 +205,8 @@ def generate_patient_summary(patient_text: str) -> Tuple[str, List[str]]:
         mistral_response = query_mistral(prompt)
         logger.debug(f"Mistral response: {mistral_response[:200]}...")
         
-        # Process Mistral response
         if "Conditions:" in mistral_response:
             summary_part, condition_part = mistral_response.split("Conditions:", 1)
-            # Extract conditions from bulleted list
             conditions = [
                 re.sub(r'\s*\(.*?\)', '', line).strip('- ').strip()
                 for line in condition_part.split('\n')
@@ -255,16 +231,13 @@ def generate_patient_summary(patient_text: str) -> Tuple[str, List[str]]:
         
         summary = summary_part.strip()
         
-        # Final validation
         if not conditions or all(c.lower() == "no conditions identified" for c in conditions):
             conditions = ["No conditions identified"]
             if not summary.strip():
                 summary = "The patient was suffering from no conditions identified."
     except Exception as e:
         logger.warning(f"Mistral failed: {e}. Using fallback extraction.")
-        # Fallback: Simple extraction of potential conditions
         words = patient_text.split()
-        # Look for phrases that might be conditions (2-6 word phrases)
         conditions = []
         for i in range(len(words)):
             for j in range(1, min(7, len(words) - i)):
@@ -272,10 +245,8 @@ def generate_patient_summary(patient_text: str) -> Tuple[str, List[str]]:
                 if 2 <= len(phrase.split()) <= 6 and len(phrase) > 5:
                     conditions.append(phrase)
         
-        # De-duplicate and take top phrases
         conditions = list(set(conditions))[:10]
         
-        # If still no conditions found, use a placeholder
         if not conditions:
             conditions = ["No conditions identified"]
         
@@ -285,8 +256,8 @@ def generate_patient_summary(patient_text: str) -> Tuple[str, List[str]]:
     logger.info(f"Conditions extracted: {conditions}")
     return summary, conditions
 
+# Getting title embedding
 def get_title_embedding(title: str) -> np.ndarray:
-    """Get embedding for a title with caching"""
     global TITLE_EMBEDDING_CACHE
     
     if title in TITLE_EMBEDDING_CACHE:
@@ -301,8 +272,8 @@ def get_title_embedding(title: str) -> np.ndarray:
     
     return embedding
 
+# Batch encoding texts 
 def batch_encode_texts(texts: List[str], batch_size: int = 50) -> np.ndarray:
-    """Encode multiple texts in batches to optimize memory usage"""
     embedder = get_sentence_embedder()
     results = []
     
@@ -319,17 +290,12 @@ def batch_encode_texts(texts: List[str], batch_size: int = 50) -> np.ndarray:
     return np.vstack(results) if results else np.array([])
 
 def execute_fts_query(query_terms: str, limit: int = 25) -> List[Tuple[str, str]]:
-    """
-    Execute a full-text search query with improved error handling
-    """
     results = []
     
-    # Sanitize the query to prevent SQL injection
     query_terms = query_terms.replace("'", "''")
     
     try:
         with connection.cursor() as cursor:
-            # Use a parameterized query for better security
             sql = f"SELECT code, title FROM icd_fts WHERE title MATCH ? ORDER BY rank LIMIT ?"
             logger.debug(f"Executing FTS query: {sql} with terms: {query_terms}")
             cursor.execute(sql, (query_terms, limit))
@@ -355,15 +321,13 @@ def get_icd_title(code: str) -> str:
         logger.error(f"Error fetching title for code {code}: {e}")
         return "Unknown title"
 
+# Find Matching ICD Codes
 def find_best_icd_match(
     conditions: List[str], 
     patient_medical_data: str, 
     existing_codes: Optional[List[str]] = None,
     use_parallel: bool = True
 ) -> Dict[str, List[Tuple[str, str, float]]]:
-    """
-    Find all matching ICD codes for given medical conditions with parallel processing
-    """
     if not conditions:
         logger.warning("No conditions provided.")
         return {}
@@ -372,12 +336,10 @@ def find_best_icd_match(
     patient_medical_data = preprocess_text(patient_medical_data or "")
     existing_codes = existing_codes or []
     
-    # Filter empty conditions
     preprocessed_conditions = [preprocess_text(cond) for cond in conditions if preprocess_text(cond)]
     if not preprocessed_conditions:
         return {}
     
-    # Skip "No conditions identified"
     valid_conditions = [(idx, cond) for idx, cond in enumerate(preprocessed_conditions) 
                        if cond.lower() != "no conditions identified"]
     
@@ -386,10 +348,8 @@ def find_best_icd_match(
             results[condition] = []
         return results
     
-    # Status words to remove for better matching
     status_words = {"resolved", "active", "chronic", "recovered", "past", "history", "of"}
     
-    # Batch encode all conditions at once for efficiency
     try:
         condition_indices = [idx for idx, _ in valid_conditions]
         condition_texts = [cond for _, cond in valid_conditions]
@@ -427,7 +387,6 @@ def find_best_icd_match(
                     logger.error(f"Error processing condition '{condition}': {e}")
                     results[condition] = []
     else:
-        # Sequential processing
         for i, (idx, cond_text) in enumerate(valid_conditions):
             try:
                 embedding = condition_embeddings[i] if len(condition_embeddings) > i else None
@@ -444,13 +403,13 @@ def find_best_icd_match(
                 logger.error(f"Error processing condition '{conditions[idx]}': {e}")
                 results[conditions[idx]] = []
     
-    # Add empty results for skipped conditions
     for condition in conditions:
         if condition not in results:
             results[condition] = []
     
     return results
 
+# Process a single condition to find all matching ICD codes
 def _process_single_condition(
     original_condition: str,
     condition_text: str, 
@@ -459,16 +418,13 @@ def _process_single_condition(
     patient_data: str,
     status_words: Set[str]
 ) -> List[Tuple[str, str, float]]:
-    """Process a single condition to find all matching ICD codes"""
-    logger.info(f"Processing condition: {original_condition}")
     
-    # Remove status words for better matching
+    logger.info(f"Processing condition: {original_condition}")
     query_term = re.sub('|'.join(rf'\b{word}\b' for word in status_words), '', condition_text).strip() or condition_text
     
-    # Execute FTS query
     fts_results = execute_fts_query(f'"{query_term}"')
     
-    # Fall back to ORM if FTS fails or returns few results
+    # Fall back to ORM
     if len(fts_results) < 3:
         logger.info(f"FTS returned {len(fts_results)} results for '{original_condition}'. Supplementing with ORM.")
         
@@ -477,26 +433,23 @@ def _process_single_condition(
         
         # Add individual word matching for terms over 3 chars
         for word in query_term.split():
-            if len(word) > 3:  # Skip short words
+            if len(word) > 3:
                 query |= Q(title__icontains=word)
         
-        # Use select_related to optimize database query
         with transaction.atomic():
             matches = (
                 ICDCategory.objects.filter(query)
-                .filter(icdcategory__isnull=True)  # Ensure leaf nodes
+                .filter(icdcategory__isnull=True)
                 .select_related('parent')
                 .only('id', 'code', 'title', 'parent__code')
             )
             
-            # Add results to FTS results
             existing_codes = {result[0] for result in fts_results}
             for match in matches:
                 if match.code not in existing_codes:
                     fts_results.append((match.code, match.title))
                     existing_codes.add(match.code)
     
-    # No results found with any method
     if not fts_results:
         logger.warning(f"No matches found for '{original_condition}'.")
         return []
@@ -504,7 +457,7 @@ def _process_single_condition(
     # Get ICD codes from FTS results
     icd_codes = [row[0] for row in fts_results]
     
-    # Fetch leaf node ICD categories efficiently
+    # Fetching leaf node ICD Values
     with transaction.atomic():
         try:
             matches = (
@@ -513,14 +466,12 @@ def _process_single_condition(
                 .only('id', 'code', 'title', 'parent__code')
             )
             
-            # Filter to leaf nodes in Python
             matches = [m for m in matches if not hasattr(m, 'icdcategory_set') or not m.icdcategory_set.exists()]
             
             if not matches:
                 logger.warning(f"No leaf node matches for '{original_condition}'.")
                 return [(fts_results[0][0], get_icd_title(fts_results[0][0]), 60.0)] if fts_results else []
             
-            # Calculate embedding similarities
             match_titles = [m.title.lower() for m in matches]
             
             try:
@@ -543,7 +494,7 @@ def _process_single_condition(
                 similarity_scores = [
                     (matches[i].code, matches[i].title, max(50, min(95, (sim + 1) * 50)))
                     for i, sim in enumerate(similarities)
-                    if (sim + 1) * 50 >= 50  # Only consider matches above 50% similarity
+                    if (sim + 1) * 50 >= 50
                 ]
                 
                 # Sort by similarity score
@@ -551,18 +502,15 @@ def _process_single_condition(
                 
             except Exception as e:
                 logger.error(f"Similarity calculation failed: {e}")
-                # Fallback to basic matching
                 similarity_scores = [(m.code, m.title, 60.0) for m in matches]
             
             if not similarity_scores:
                 logger.warning(f"No similarity matches for '{original_condition}'.")
                 return [(fts_results[0][0], get_icd_title(fts_results[0][0]), 60.0)] if fts_results else []
             
-            # Use all candidates for Mistral
             candidate_list = similarity_scores
             candidate_text = "\n".join([f"{code}: {title} ({score:.1f}%)" for code, title, score in candidate_list])
             
-            # Use Mistral for refinement if available
             try:
                 prompt = (
                     f"Analyze the patient's medical data and the clinical condition: '{original_condition}'.\n\n"
@@ -588,7 +536,6 @@ def _process_single_condition(
                 matched_codes = []
                 if mistral_response.strip() and mistral_response.strip() != '[]':
                     for line in mistral_response.split('\n'):
-                        # Improved regex to handle various formats
                         match = re.search(r'(?:\[)?([A-Za-z]\d+(?:\.\d+)?)(?:\])?:?\s*(.+?)\s*\((\d+(?:\.\d+)?)(?:%|\))', line.strip())
                         if match:
                             code, title, percent = match.groups()
@@ -601,7 +548,7 @@ def _process_single_condition(
                                 matched_codes.append((code, db_title, percent))
                                 logger.debug(f"Accepted match: {code} ({percent}%)")
                 
-                # Remove duplicates, keep highest score
+                # Remove duplicates
                 matched_codes_dict = {}
                 for code, title, score in matched_codes:
                     if code not in matched_codes_dict or score > matched_codes_dict[code][2]:
@@ -609,7 +556,7 @@ def _process_single_condition(
                 
                 final_matches = list(matched_codes_dict.values())
                 
-                # Return Mistral's results if available, otherwise all similarity scores
+                # Return Mistral's results if available
                 if final_matches:
                     return sorted(final_matches, key=lambda x: x[2], reverse=True)
                 
