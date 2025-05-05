@@ -29,17 +29,12 @@ def predict_icd_code(self, admission_id):
             best_code = None
             best_score = None
             
-            # Relevance heuristic: boost codes with "calculus" or "ureter" in title
-            relevance_terms = ['calculus', 'ureter', 'kidney', 'renal', 'stone']
             
             for condition, matches in icd_matches.items():
                 for code, title, confidence in matches:
                     if code and confidence >= 60:
-                        # Calculate relevance score
                         relevance_boost = 1.0
                         title_lower = title.lower()
-                        if any(term in title_lower for term in relevance_terms):
-                            relevance_boost = 1.2  # Boost relevant codes
                         adjusted_score = confidence * relevance_boost
                         
                         all_matches.append({
@@ -48,7 +43,6 @@ def predict_icd_code(self, admission_id):
                             'confidence': round(confidence, 1)
                         })
                         
-                        # Track the highest-scoring match
                         if best_score is None or adjusted_score > best_score:
                             best_code = code
                             best_score = adjusted_score

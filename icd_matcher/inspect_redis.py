@@ -1,9 +1,9 @@
-# icd_matcher/inspect_redis.py
 import os
 import sys
 import redis
 import json
 import django
+from datetime import datetime, timedelta
 
 # Add project root to sys.path
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -58,11 +58,27 @@ def inspect_redis():
                 # Correlate with database
                 task_id = decoded['task_id']
                 date_done = decoded.get('date_done', '')
-                records = MedicalAdmissionDetails.objects.filter(created_at__contains=date_done[:10])
-                if records:
-                    print("Related database records:")
-                    for r in records:
-                        print(f"- ID: {r.id}, ICD Codes: {r.predicted_icd_codes}")
+                if date_done:
+                    try:
+                        # Parse date_done (ISO format: 2025-05-05T06:46:04.542845+00:00)
+                        date_done_dt = datetime.fromisoformat(date_done.replace('Z', '+00:00'))
+                        # Filter records within a 1-hour range
+                        start_date = date_done_dt - timedelta(hours=1)
+                        end_date = date_done_dt + timedelta(hours=1)
+                        records = MedicalAdmissionDetails.objects.filter(
+                            created_at__range=(start_date, end_date)
+                        )
+                        if records:
+                            print("Related database records:")
+                            for record in records:
+                                icd_codes = getattr(record, 'predicted_icd_codes', []) or []
+                                print(f"- ID: {record.id}, ICD Codes: {icd_codes}")
+                        else:
+                            print("No related database records found")
+                    except ValueError as e:
+                        print(f"Error parsing date_done: {e}")
+                else:
+                    print("No date_done available for correlation")
             except json.JSONDecodeError:
                 print(f"{key}: (Unparseable) {result}")
 

@@ -2,7 +2,7 @@ from django.db import connection
 from ninja import NinjaAPI, Schema
 from typing import Dict, List, Tuple, Optional
 from datetime import date
-from pydantic import Field, validator
+from pydantic import Field, field_validator
 import logging
 from .utils.text_processing import generate_patient_summary, get_negation_cues, is_not_negated
 from .utils.embeddings import (
@@ -37,7 +37,7 @@ class ICDMatch(Schema):
     title: Optional[str] = None
     confidence: float = Field(..., description="Confidence score (0-100)")
 
-    @validator('confidence')
+    @field_validator('confidence')
     def round_confidence(cls, v):
         return round(v, 1)
 

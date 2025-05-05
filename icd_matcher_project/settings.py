@@ -76,10 +76,17 @@ TEMPLATES = [
 WSGI_APPLICATION = 'icd_matcher_project.wsgi.application'
 ASGI_APPLICATION = "icd_matcher_project.asgi.application"
 
+# DATABASES = {
+#     'default': {
+#         'ENGINE': 'django.db.backends.sqlite3',
+#         'NAME': os.path.join(BASE_DIR, 'db.sqlite3'),
+#     }
+# }
+
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': os.path.join(BASE_DIR, 'db.sqlite3'),
+        'NAME': ':memory:',
     }
 }
 
