@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Admission Details</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        h1 { color: #333; }
+        .section { margin-bottom: 20px; }
+        .label { font-weight: bold; }
+        .error { color: red; }
+    </style>
+</head>
+<body>
+    <h1>Admission Details</h1>
+    {% if error %}
+        <p class="error">{{ error }}</p>
+    {% else %}
+        <div class="section">
+            <p class="label">Admission ID:</p>
+            <p>{{ admission_id }}</p>
+        </div>
+        <div class="section">
+            <p class="label">Patient Data:</p>
+            <p>{{ patient_data }}</p>
+        </div>
+        <div class="section">
+            <p class="label">Summary:</p>
+            <p>{{ summary }}</p>
+        </div>
+        <div class="section">
+            <p class="label">Conditions:</p>
+            <ul>
+                {% for condition in conditions %}
+                    <li>{{ condition }}</li>
+                {% empty %}
+                    <li>No conditions identified</li>
+                {% endfor %}
+            </ul>
+        </div>
+        <div class="section">
+            <p class="label">ICD Matches:</p>
+            {% for condition, matches in icd_matches.items %}
+                <p><strong>{{ condition }}:</strong></p>
+                <ul>
+                    {% for code, title, score in matches %}
+                        <li>{{ code }}: {{ title }} ({{ score }}%)</li>
+                    {% empty %}
+                        <li>No matches found</li>
+                    {% endfor %}
+                </ul>
+            {% empty %}
+                <p>No matches found</p>
+            {% endfor %}
+        </div>
+        <div class="section">
+            <p class="label">Predefined ICD Codes:</p>
+            <ul>
+                {% for item in predefined_icd_codes %}
+                    <li>{{ item.code }}: {{ item.title }}</li>
+                {% empty %}
+                    <li>No predefined codes</li>
+                {% endfor %}
+            </ul>
+        </div>
+        <div class="section">
+            <p class="label">Admission Details:</p>
+            <p>Admission Date: {{ admission.admission_date }}</p>
+            <p>Admission Type: {{ admission.admission_type }}</p>
+            <p>Admission Status: {{ admission.admission_status }}</p>
+            <p>Discharge Ward: {{ admission.discharge_ward }}</p>
+        </div>
+    {% endif %}
+    <a href="{% url 'patient_input' %}">Back to Input</a>
+</body>
+</html>

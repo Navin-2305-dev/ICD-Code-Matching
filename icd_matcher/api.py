@@ -1,15 +1,20 @@
+from functools import cache
+from http.client import HTTPException
 from django.db import connection
 from ninja import NinjaAPI, Schema
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Optional
 from datetime import date
 from pydantic import Field, field_validator
 import logging
-from .utils.text_processing import generate_patient_summary, get_negation_cues, is_not_negated
-from .utils.embeddings import (
-    find_best_icd_match,
-    preprocess_text
-)
-from .models import ICDCategory
+from asgiref.sync import sync_to_async
+from icd_matcher.utils.text_processing import generate_patient_summary, get_negation_cues, is_not_negated
+from icd_matcher.utils.embeddings import find_best_icd_match
+from icd_matcher.utils.text_processing import preprocess_text
+from icd_matcher.models import ICDCategory, MedicalAdmissionDetails
+from icd_matcher.utils.rag_kag_pipeline import RAGKAGPipeline
+from icd_matcher.utils.db_utils import get_icd_title
+from django.conf import settings
+import uuid
 
 logger = logging.getLogger(__name__)
 
@@ -47,8 +52,8 @@ class ConditionMatch(Schema):
 
 class PatientSummaryResponse(Schema):
     summary: str
-    conditions: List[str]
-    icd_matches: List[ConditionMatch]
+    conditions: List[ConditionMatch]
+    admission_id: Optional[int] = None
 
 class ICDCodeSearchResponse(Schema):
     code: str
@@ -58,103 +63,111 @@ class ICDCodeSearchResponse(Schema):
     parent_title: Optional[str] = None
 
 @api.post("/match-patient", response=PatientSummaryResponse, tags=["ICD Matching"])
-def match_patient(request, data: PatientInput):
+async def match_patient_data(request, payload: PatientInput):
+    """Match patient data to ICD codes and save to database."""
     try:
-        patient_text = (
-            f"A: {data.icd_remarks_admission}\n"
-            f"D: {data.icd_remarks_discharge} - {data.discharge_ward} - "
-            f"Follow-up after {data.admission_type} admission on {data.admission_date} "
-            f"with status {data.admission_status}"
-        )
+        patient_data = (
+            f"A: {payload.icd_remarks_admission or ''} "
+            f"D: {payload.icd_remarks_discharge or ''}"
+        ).strip()
+        if not patient_data:
+            raise ValueError("No valid patient data provided")
 
-        corrected_text = preprocess_text(patient_text)
-        summary, conditions = generate_patient_summary(corrected_text)
-        negation_cues = get_negation_cues()
-        non_negated_conditions = sorted(
-            [cond for cond in conditions if is_not_negated(cond, corrected_text, negation_cues)],
-            key=len, reverse=True
-        )
+        summary, conditions = await generate_patient_summary(patient_data)
+        if not conditions or conditions == ['No conditions identified']:
+            raise ValueError("No specific conditions identified")
 
-        patient_codes = find_best_icd_match(
-            non_negated_conditions,
-            patient_text,
-            data.predefined_icd_codes
-        )
-
-        icd_matches = []
-        for condition, matches in patient_codes.items():
-            condition_matches = []
-            for code, title, score in matches:
-                if code and score >= 60:
-                    condition_matches.append(ICDMatch(code=code, title=get_icd_title(code), confidence=score))
-                else:
-                    condition_matches.append(ICDMatch(code=None, title=None, confidence=0))
-
-            if condition_matches:
-                icd_matches.append(ConditionMatch(condition=condition, matches=condition_matches))
-
-        return PatientSummaryResponse(
-            summary=summary,
-            conditions=non_negated_conditions,
-            icd_matches=icd_matches
-        )
-    except Exception as e:
-        logger.error(f"Error processing patient data: {str(e)}")
-        raise
-
-@api.post("/match-text", response=List[ConditionMatch], tags=["ICD Matching"])
-def match_medical_text(request, data: ICDCodeQuery):
-    try:
-        processed_text = preprocess_text(data.medical_text)
-        summary, conditions = generate_patient_summary(processed_text)
-        logger.info(f"Extracted conditions: {conditions}")
-        negation_cues = get_negation_cues()
         non_negated_conditions = [
             cond for cond in conditions
-            if is_not_negated(cond, processed_text, negation_cues)
+            if await sync_to_async(is_not_negated)(cond, patient_data)
+        ]
+        pipeline = await RAGKAGPipeline.create()
+        icd_matches = pipeline.run(patient_data)
+        condition_matches = [
+            ConditionMatch(condition=cond, matches=[
+                ICDMatch(code=code, title=await get_icd_title(code), confidence=score)
+                for code, title, score in matches
+            ])
+            for cond, matches in icd_matches.items()
         ]
 
-        matches = find_best_icd_match(
-            non_negated_conditions,
-            processed_text,
-            data.existing_codes
+        admission = await sync_to_async(MedicalAdmissionDetails.objects.create)(
+            patient_data=patient_data,
+            admission_date=payload.admission_date,
+            admission_type=payload.admission_type,
+            admission_status=payload.admission_status,
+            discharge_ward=payload.discharge_ward,
+            predicted_icd_code=condition_matches[0].matches[0].code if condition_matches and condition_matches[0].matches else "",
+            prediction_accuracy=condition_matches[0].matches[0].confidence if condition_matches and condition_matches[0].matches else 0.0,
+            predicted_icd_codes=[{"code": m.code, "title": m.title, "confidence": m.confidence} for cm in condition_matches for m in cm.matches]
         )
-
-        result = []
-        for condition, code_matches in matches.items():
-            condition_matches = []
-            for code, title, confidence in code_matches:
-                if code and confidence >= 60:
-                    condition_matches.append(ICDMatch(code=code, title=get_icd_title(code), confidence=confidence))
-                else:
-                    condition_matches.append(ICDMatch(code=None, title=None, confidence=0))
-
-            result.append(ConditionMatch(condition=condition, matches=condition_matches))
-
-        return result
+        cache_key = f"icd_prediction_{admission.id}_{uuid.uuid4().hex}"
+        await sync_to_async(cache.set)(
+            cache_key, icd_matches, timeout=settings.ICD_MATCHING_SETTINGS.get('CACHE_TTL', 3600)
+        )
+        return PatientSummaryResponse(
+            summary=summary,
+            conditions=condition_matches,
+            admission_id=admission.id
+        )
     except Exception as e:
-        logger.error(f"Error matching medical text: {str(e)}")
-        raise
+        logger.error(f"Error matching patient data: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@api.post("/match-text", response=PatientSummaryResponse, tags=["ICD Matching"])
+async def match_medical_text(request, payload: ICDCodeQuery):
+    """Match medical text to ICD codes without saving."""
+    try:
+        patient_data = payload.medical_text.strip()
+        if not patient_data:
+            raise ValueError("No valid medical text provided")
+
+        summary, conditions = await generate_patient_summary(patient_data)
+        if not conditions or conditions == ['No conditions identified']:
+            raise ValueError("No specific conditions identified")
+
+        non_negated_conditions = [
+            cond for cond in conditions
+            if await sync_to_async(is_not_negated)(cond, patient_data)
+        ]
+        pipeline = await RAGKAGPipeline.create()
+        icd_matches = pipeline.run(patient_data)
+        condition_matches = [
+            ConditionMatch(condition=cond, matches=[
+                ICDMatch(code=code, title=await get_icd_title(code), confidence=score)
+                for code, title, score in matches
+            ])
+            for cond, matches in icd_matches.items()
+        ]
+        return PatientSummaryResponse(
+            summary=summary,
+            conditions=condition_matches,
+            admission_id=None
+        )
+    except Exception as e:
+        logger.error(f"Error matching medical text: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @api.get("/search-icd", response=List[ICDCodeSearchResponse], tags=["ICD Search"])
-def search_icd_codes(request, query: str, limit: int = 20):
+async def search_icd_codes(request, query: str, limit: int = 20):
     try:
-        query = preprocess_text(query)
-        results = []
+        query = preprocess_text(query.strip())
+        if not query:
+            return []
 
+        results = []
         with connection.cursor() as cursor:
-            sql = f"SELECT code, title FROM icd_fts WHERE title MATCH '\"{query}\"' ORDER BY rank LIMIT {limit}"
-            cursor.execute(sql)
+            sql = "SELECT code, title FROM icd_fts WHERE title MATCH %s ORDER BY rank LIMIT %s"
+            cursor.execute(sql, [f'"{query}"', limit])
             fts_results = cursor.fetchall()
 
         if fts_results:
             codes = [row[0] for row in fts_results]
-            icd_entries = ICDCategory.objects.filter(code__in=codes).select_related('parent')
+            icd_entries = await sync_to_async(ICDCategory.objects.filter(code__in=codes).select_related('parent').all)()
 
             for entry in icd_entries:
                 parent_code = entry.parent.code if entry.parent else None
                 parent_title = entry.parent.title if entry.parent else None
-
                 results.append(ICDCodeSearchResponse(
                     code=entry.code,
                     title=entry.title,
@@ -165,24 +178,22 @@ def search_icd_codes(request, query: str, limit: int = 20):
 
         return results
     except Exception as e:
-        logger.error(f"Error searching ICD codes: {str(e)}")
-        raise
+        logger.error(f"Error searching ICD codes: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @api.get("/icd/{code}", response=ICDCodeSearchResponse, tags=["ICD Search"])
-def get_icd_code(request, code: str):
+async def get_icd_code(request, code: str):
     try:
-        icd_entry = ICDCategory.objects.filter(code=code).select_related('parent').first()
+        icd_entry = await sync_to_async(ICDCategory.objects.filter(code=code).select_related('parent').first)()
         if not icd_entry:
             return api.create_response(
                 request,
                 {"message": f"ICD code {code} not found"},
                 status=404
-                
             )
 
         parent_code = icd_entry.parent.code if icd_entry.parent else None
         parent_title = icd_entry.parent.title if icd_entry.parent else None
-
         return ICDCodeSearchResponse(
             code=icd_entry.code,
             title=icd_entry.title,
@@ -191,15 +202,5 @@ def get_icd_code(request, code: str):
             parent_title=parent_title
         )
     except Exception as e:
-        logger.error(f"Error fetching ICD code details: {str(e)}")
-        raise
-
-def get_icd_title(code: str) -> str:
-    try:
-        icd_entry = ICDCategory.objects.filter(code=code).only('title').first()
-        print(f"Code: {code}, Title: {icd_entry.title if icd_entry else 'Unknown title'}")
-        title = icd_entry.title if icd_entry else "Unknown title"
-        return title
-    except Exception as e:
-        logger.error(f"Error fetching title for code {code}: {e}")
-        return "Unknown title"
+        logger.error(f"Error fetching ICD code details: {e}")
+        raise HTTPException(status_code=500, detail=str(e))

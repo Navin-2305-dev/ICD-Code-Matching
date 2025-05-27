@@ -5,4 +5,5 @@ class IcdMatcherConfig(AppConfig):
     name = 'icd_matcher'
 
     def ready(self):
-        import icd_matcher.signals
+        """Run initialization tasks after app registry is ready."""
+        pass  # Graph building moved to management command

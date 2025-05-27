@@ -15,34 +15,37 @@ INSTALLED_APPS = [
     'django.contrib.messages',
     'django.contrib.staticfiles',
     'django_extensions',
-    'jsonfield',
-    'icd_matcher',
+    'icd_matcher.apps.IcdMatcherConfig',
 ]
 
-# CACHES = {
-#     'default': {
-#         'BACKEND': 'django.core.cache.backends.filebased.FileBasedCache',
-#         'LOCATION': os.path.join(BASE_DIR, 'cache'),
-#     }
-# }
-
 ICD_MATCHING_SETTINGS = {
-    'CACHE_TTL': 3600,
+    'MISTRAL_LOCAL_URL': 'http://localhost:11434/api/generate',
+    'MISTRAL_MODEL': 'mistral',
+    'CACHE_TTL': 86400,  # 24 hours
     'BATCH_SIZE': 32,
-    'MAX_WORKERS': 4,
-    'MIN_SIMILARITY_SCORE': 70.0,
-    'MAX_SIMILARITY_SCORE': 100.0,
-    'FTS_QUERY_LIMIT': 25,
-    'MAX_CANDIDATES': 25,
-    'INCLUSION_BOOST': 1.1,
-    'EXCLUSION_PENALTY': 0.5,
-    'NEGATION_WINDOW': 5,
+    'FTS_QUERY_LIMIT': 10,
+    'MAX_CANDIDATES': 15,
+    'MIN_SIMILARITY_SCORE': 60,
+    'MAX_SIMILARITY_SCORE': 95,
+    'ALLOW_CATEGORY_CODES': True,
+    'NEGATION_WINDOW': 10,
+    'MAX_PIPELINE_ITERATIONS': 2,  # Allow one refinement iteration
+    'PREPROCESS_CALL_LIMIT': 1000,
+    'GRAPH_BUILD_BATCH_SIZE': 1000,
+    'USE_RAG_KAG': True,
     'NEGATION_CUES': [
-        "no", "not", "denies", "negative", "without", "absent", "ruled out", 
-        "non", "never", "lacks", "excludes", "rules out", "negative for", 
+        "no", "not", "denies", "negative", "without", "absent", "ruled out",
+        "non", "never", "lacks", "excludes", "rules out", "negative for",
         "free of", "deny", "denying", "unremarkable for"
-    ],
-    'MISTRAL_API_URL': "http://localhost:11434/api/generate",
+    ]
+}
+
+CACHES = {
+    'default': {
+        'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
+        'LOCATION': 'icd_matcher_cache',
+        'KEY_FUNCTION': lambda key, key_prefix, version: key.replace(':', '_').replace(' ', '_')[:250],
+    }
 }
 
 MIDDLEWARE = [
@@ -83,13 +86,6 @@ DATABASES = {
     }
 }
 
-# DATABASES = {
-#     'default': {
-#         'ENGINE': 'django.db.backends.sqlite3',
-#         'NAME': ':memory:',
-#     }
-# }
-
 AUTH_PASSWORD_VALIDATORS = [
     {
         'NAME': 'django.contrib.auth.password_validation.UserAttributeSimilarityValidator',
@@ -105,6 +101,27 @@ AUTH_PASSWORD_VALIDATORS = [
     },
 ]
 
+LOGGING = {
+    'version': 1,
+    'disable_existing_loggers': False,
+    'handlers': {
+        'console': {
+            'class': 'logging.StreamHandler',
+        },
+        'file': {
+            'class': 'logging.FileHandler',
+            'filename': 'icd_matcher.log',
+        },
+    },
+    'loggers': {
+        'icd_matcher': {
+            'handlers': ['console', 'file'],
+            'level': 'DEBUG',
+            'propagate': True,
+        },
+    },
+}
+
 LANGUAGE_CODE = 'en-us'
 TIME_ZONE = 'UTC'
 USE_I18N = True
@@ -116,7 +133,6 @@ STATIC_ROOT = os.path.join(BASE_DIR, 'staticfiles')
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
-# Celery Configuration
 CELERY_BROKER_URL = 'redis://localhost:6379/0'
 CELERY_RESULT_BACKEND = 'redis://localhost:6379/0'
 CELERY_ACCEPT_CONTENT = ['json']

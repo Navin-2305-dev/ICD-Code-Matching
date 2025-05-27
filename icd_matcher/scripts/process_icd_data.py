@@ -1,63 +1,112 @@
 import logging
 import pandas as pd
 from django.conf import settings
+from django.core.cache import cache
 from icd_matcher.models import ICDCategory
-from icd_matcher.utils.embeddings import find_best_icd_match
-from icd_matcher.utils.text_processing import generate_patient_summary
-from pathlib import Path
+from icd_matcher.utils.rag_kag_pipeline import RAGKAGPipeline
+from icd_matcher.utils.text_processing import generate_patient_summary, is_not_negated
 from icd_matcher.utils.exceptions import TrainingDataLoadError, TrainingDataProcessingError, ResultSavingError
+from pathlib import Path
+from celery import group
+from asgiref.sync import sync_to_async
+import asyncio
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
-# Ensure the logs directory exists
-base_dir = Path(__file__).resolve().parent.parent.parent
+base_dir = Path(__file__).resolve().parent.parent
 logs_dir = base_dir / 'data' / 'logs'
 logs_dir.mkdir(parents=True, exist_ok=True)
 
-# File handler
 log_file = logs_dir / 'process_icd_data.log'
 file_handler = logging.FileHandler(log_file)
 file_handler.setLevel(logging.DEBUG)
 file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 file_handler.setFormatter(file_formatter)
 
-# Console handler
 console_handler = logging.StreamHandler()
 console_handler.setLevel(logging.INFO)
 console_formatter = logging.Formatter('%(levelname)s - %(message)s')
 console_handler.setFormatter(console_formatter)
 
-# Add handlers
 logger.handlers = []
 logger.addHandler(file_handler)
 logger.addHandler(console_handler)
 
-def get_icd_title(code):
-    """Retrieve ICD title from ICDCategory or return a placeholder."""
+async def get_icd_title(code):
     logger.debug(f"Retrieving title for ICD code: {code}")
     try:
-        icd_entry = ICDCategory.objects.get(code=code)
+        icd_entry = await sync_to_async(ICDCategory.objects.get)(code=code)
         logger.debug(f"Found title for {code}: {icd_entry.title}")
         return icd_entry.title
     except ICDCategory.DoesNotExist:
         logger.warning(f"ICD code {code} not found in database")
         return f"Title for {code}"
 
-def run():
-    """Process training data to match ICD codes and save results."""
+async def process_row(row, semaphore):
+    """Process a single row of the training dataset."""
+    async with semaphore:
+        try:
+            medical_text = (
+                f"{row.get('DISCHARGE_REMARKS', '')} "
+                f"A: {row.get('ICD_REMARKS_A', '')} "
+                f"D: {row.get('ICD_REMARKS_D', '')}"
+            ).strip()
+            logger.debug(f"Processing row with medical text: {medical_text[:200]}")
+            summary, conditions = await generate_patient_summary(medical_text)
+            non_negated_conditions = [
+                cond for cond in conditions
+                if await sync_to_async(is_not_negated)(cond, medical_text)
+            ]
+
+            pipeline = RAGKAGPipeline()  # Instantiate the pipeline directly
+            icd_matches = pipeline.run(medical_text)
+            generated_codes = []
+            for condition, matches in icd_matches.items():
+                for code, title, score in matches:
+                    if score >= settings.ICD_MATCHING_SETTINGS.get('MIN_SIMILARITY_SCORE', 60):
+                        generated_codes.append(f"{code}: {title} ({score:.1f}%)")
+
+            for code in generated_codes:
+                code_part = code.split(':')[0]
+                try:
+                    icd_entry = await sync_to_async(ICDCategory.objects.get)(code=code_part)
+                    icd_entry.title = code.split(': ')[1].split(' (')[0]
+                    await sync_to_async(icd_entry.save)()
+                except ICDCategory.DoesNotExist:
+                    await sync_to_async(ICDCategory.objects.create)(
+                        code=code_part,
+                        title=code.split(': ')[1].split(' (')[0]
+                    )
+
+            cache_key = f"training_result_{hash(medical_text[:1000])}"
+            await sync_to_async(cache.set)(
+                cache_key,
+                {'summary': summary, 'conditions': non_negated_conditions, 'icd_matches': icd_matches},
+                timeout=settings.ICD_MATCHING_SETTINGS.get('CACHE_TTL', 3600)
+            )
+
+            return {
+                'DISCHARGE_REMARKS': row.get('DISCHARGE_REMARKS', ''),
+                'ICD_REMARKS_A': row.get('ICD_REMARKS_A', ''),
+                'ICD_REMARKS_D': row.get('ICD_REMARKS_D', ''),
+                'Predefined ICD_code': row.get('Predefined ICD_code', ''),
+                'Generated Matching ICD Code(s)': '; '.join(generated_codes)
+            }
+        except Exception as e:
+            logger.error(f"Error processing row: {e}")
+            raise TrainingDataProcessingError(f"Error processing row: {e}")
+
+async def run():
     logger.info("Starting ICD code matching process")
 
-    # Define the data directory
     data_dir = base_dir / 'data' / 'training_data'
     data_dir.mkdir(parents=True, exist_ok=True)
 
-    # Get the training data path
     default_data_path = data_dir / 'Training_dataset.csv'
     data_path = Path(getattr(settings, 'TRAINING_DATA_PATH', default_data_path))
     logger.debug(f"Training data path: {data_path}")
 
-    # Load the training data
     logger.info(f"Attempting to load training data from {data_path}")
     try:
         df = pd.read_csv(data_path)
@@ -73,10 +122,8 @@ def run():
         logger.error(f"Error reading training data: {e}")
         raise TrainingDataLoadError(f"Error reading training data: {e}")
 
-    # Validate columns
     expected_columns = ['DISCHARGE_REMARKS', 'ICD_REMARKS_A', 'ICD_REMARKS_D', 
                        'Predefined ICD_code', 'Generated Matching ICD Code(s)']
-    logger.debug(f"Expected columns: {expected_columns}")
     if not all(col in df.columns for col in expected_columns):
         missing_cols = [col for col in expected_columns if col not in df.columns]
         logger.error(f"Missing columns in training data: {missing_cols}")
@@ -85,78 +132,17 @@ def run():
     results = []
     logger.info("Starting processing of training data rows")
 
-    for index, row in df.iterrows():
-        logger.debug(f"Processing row {index}")
-        try:
-            discharge_remarks = row['DISCHARGE_REMARKS']
-            icd_remarks_a = row['ICD_REMARKS_A']
-            icd_remarks_d = row['ICD_REMARKS_D']
-            predefined_icd = row['Predefined ICD_code']
-            expected_matches = row['Generated Matching ICD Code(s)']
+    batch_size = settings.ICD_MATCHING_SETTINGS.get('BATCH_SIZE', 32)
+    for i in range(0, len(df), batch_size):
+        batch = df.iloc[i:i+batch_size]
+        tasks = [process_row(row, index) for index, row in batch.iterrows()]
+        batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+        for result in batch_results:
+            if isinstance(result, Exception):
+                logger.error(f"Error in batch processing: {result}")
+                continue
+            results.append(result)
 
-            logger.debug(f"Row {index} - Discharge Remarks: {discharge_remarks}")
-            logger.debug(f"Row {index} - ICD Remarks A: {icd_remarks_a}")
-            logger.debug(f"Row {index} - ICD Remarks D: {icd_remarks_d}")
-            logger.debug(f"Row {index} - Predefined ICD: {predefined_icd}")
-            logger.debug(f"Row {index} - Expected Matches: {expected_matches}")
-
-            medical_text = f"{discharge_remarks} {icd_remarks_a} {icd_remarks_d}"
-            logger.debug(f"Row {index} - Combined medical text: {medical_text}")
-
-            summary, conditions = generate_patient_summary(medical_text)
-            logger.info(f"Row {index}: Generated summary: {summary}")
-            logger.debug(f"Row {index}: Identified conditions: {conditions}")
-
-            matched_codes = []
-
-            if not conditions or all(c.lower() == "no conditions identified" for c in conditions):
-                logger.info(f"Row {index}: No valid conditions found")
-                matched_codes.append("None (0.0%)")
-            else:
-                icd_matches = find_best_icd_match(conditions, medical_text)
-                logger.debug(f"Row {index}: ICD matches: {icd_matches}")
-
-                for condition, matches in icd_matches.items():
-                    if not matches:
-                        logger.info(f"Row {index}: No ICD matches for condition: {condition}")
-                        continue
-
-                    for code, title, score in matches:
-                        match_str = f"{code}: {title} ({score:.1f}%)"
-                        matched_codes.append(match_str)
-
-                        logger.debug(f"Row {index}: Updating/creating ICDCategory for code {code}")
-                        ICDCategory.objects.update_or_create(
-                            code=code,
-                            defaults={
-                                'definition': medical_text
-                            }
-                        )
-                        logger.info(
-                            f"Row {index}: Condition: {condition}, "
-                            f"Matched ICD: {code}, Score: {score:.1f}%, "
-                            f"Predefined ICD: {predefined_icd}, "
-                            f"Expected Matches: {expected_matches}"
-                        )
-
-            matched_codes_str = ", ".join(matched_codes) if matched_codes else "None (0.0%)"
-            logger.debug(f"Row {index}: Matched codes string: {matched_codes_str}")
-
-            results.append({
-                'DISCHARGE_REMARKS': discharge_remarks,
-                'ICD_REMARKS_A': icd_remarks_a,
-                'ICD_REMARKS_D': icd_remarks_d,
-                'Predefined ICD_code': predefined_icd,
-                'Generated Matching ICD Code(s)': expected_matches,
-                'Matched ICD Codes': matched_codes_str
-            })
-            logger.debug(f"Row {index}: Added result to list")
-
-        except Exception as e:
-            logger.error(f"Error processing row {index}: {e}")
-            raise TrainingDataProcessingError(f"Error processing row {index}: {e}")
-
-    # Save results
     output_dir = base_dir / 'data' / 'output'
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / 'results.csv'
@@ -171,3 +157,6 @@ def run():
         raise ResultSavingError(f"Error saving results: {e}")
 
     logger.info("ICD code matching process completed successfully")
+
+if __name__ == "__main__":
+    asyncio.run(run())

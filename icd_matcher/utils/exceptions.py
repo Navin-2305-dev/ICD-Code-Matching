@@ -1,4 +1,3 @@
-# File: exceptions.py
 class DatabaseSetupError(Exception):
     """Raised when setting up the FTS5 table or triggers fails."""
     pass
@@ -61,4 +60,13 @@ class PatientInputProcessingError(Exception):
 
 class ICDSearchError(Exception):
     """Raised when searching ICD codes via FTS fails."""
+    pass
+
+class ICDMatcherError(Exception):
+    pass
+
+class DatabaseError(ICDMatcherError):
+    pass
+
+class DatabaseSetupError(DatabaseError):
     pass

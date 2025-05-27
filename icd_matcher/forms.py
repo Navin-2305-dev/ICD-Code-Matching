@@ -1,4 +1,3 @@
-# icd_matcher/forms.py
 from django import forms
 
 class PatientInputForm(forms.Form):

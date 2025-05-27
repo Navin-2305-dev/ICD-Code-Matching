@@ -1,152 +1,208 @@
 import logging
 import re
-import requests
-from typing import List, Tuple, Optional, Set
+from typing import List, Tuple, Optional
 from django.core.cache import cache
 from django.conf import settings
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-from .exceptions import TextPreprocessingError, MistralQueryError, ConditionExtractionError
+from asgiref.sync import sync_to_async
+import requests
+import json
+from threading import local
+from icd_matcher.utils.exceptions import MistralQueryError
 
 logger = logging.getLogger(__name__)
+_thread_local = local()
 
-def preprocess_text(text: str) -> str:
-    """Preprocess text by normalizing case, handling medical terms, and collapsing whitespace."""
+def _get_preprocess_counter():
+    """Get thread-local preprocess counter."""
+    if not hasattr(_thread_local, 'preprocess_counter'):
+        _thread_local.preprocess_counter = 0
+    return _thread_local.preprocess_counter
+
+def _increment_preprocess_counter():
+    """Increment thread-local preprocess counter."""
+    if not hasattr(_thread_local, 'preprocess_counter'):
+        _thread_local.preprocess_counter = 0
+    _thread_local.preprocess_counter += 1
+    return _thread_local.preprocess_counter
+
+def reset_preprocess_counter():
+    """Reset thread-local preprocess counter."""
+    _thread_local.preprocess_counter = 0
+
+def preprocess_text(text: str, bypass_counter_limit: bool = False) -> str:
+    """Normalize input text."""
     if not isinstance(text, str):
         logger.error("Input text must be a string")
-        raise TextPreprocessingError("Input text must be a string")
-    
+        raise ValueError("Input text must be a string")
+    if not text.strip():
+        logger.debug("Empty text provided, returning empty string")
+        return ""
+
+    if not bypass_counter_limit:
+        count = _increment_preprocess_counter()
+        max_calls = settings.ICD_MATCHING_SETTINGS.get('PREPROCESS_CALL_LIMIT', 1000)
+        if count > max_calls:
+            logger.error("Excessive preprocess_text calls detected, possible loop")
+            raise RuntimeError("Excessive preprocess_text calls")
+
+    cache_key = f"preprocessed_text_{hash(text[:1000])}_{text[:50]}"
+    cached_text = cache.get(cache_key)
+    if cached_text is not None:
+        logger.debug(f"Cache hit for preprocess_text: {text[:200]}")
+        return cached_text
+
     try:
         text = text.lower().strip()
-        return text.strip()
+        text = re.sub(r'\s+', ' ', text)
+        # Expand common medical abbreviations
+        text = re.sub(r'\bb/l\b', 'bilateral', text, flags=re.IGNORECASE)
+        text = re.sub(r'\binv\b', 'investigation', text, flags=re.IGNORECASE)
+        cache.set(cache_key, text, timeout=settings.ICD_MATCHING_SETTINGS.get('CACHE_TTL', 3600))
+        logger.debug(f"Preprocessed text: {text[:200]}")
+        return text
     except Exception as e:
         logger.error(f"Text preprocessing failed: {e}")
-        raise TextPreprocessingError(f"Text preprocessing failed: {e}")
+        raise ValueError(f"Text preprocessing failed: {e}")
 
 def get_negation_cues() -> List[str]:
-    """Return a list of negation cues from settings or default."""
-    return getattr(settings, 'ICD_MATCHING_SETTINGS', {}).get('NEGATION_CUES', [
-        "no", "not", "denies", "negative", "without", "absent", "ruled out", 
-        "non", "never", "lacks", "excludes", "rules out", "negative for", 
+    """Return negation cues from settings or default list."""
+    return settings.ICD_MATCHING_SETTINGS.get('NEGATION_CUES', [
+        "no", "not", "denies", "negative", "without", "absent", "ruled out",
+        "non", "never", "lacks", "excludes", "rules out", "negative for",
         "free of", "deny", "denying", "unremarkable for"
     ])
 
 def is_not_negated(condition: str, text: str, negation_cues: Optional[List[str]] = None, window: int = None) -> bool:
-    """Check if a condition is not negated in the text with caching."""
+    """Check if a condition is not negated in the text."""
     if not condition or not text:
+        logger.debug("No condition or text, returning True")
         return True
-    
-    cache_key = f"negation_check_{hash(condition)}_{hash(text[:1000])}"
+
+    cache_key = f"negation_check_{condition[:50]}_{hash(text[:1000])}"
     cached_result = cache.get(cache_key)
     if cached_result is not None:
-        logger.debug(f"Cache hit for negation check: {condition}")
+        logger.debug(f"Cache hit for negation check: {condition} -> {cached_result}")
         return cached_result
-    
+
     try:
-        text_lower = text.lower() if isinstance(text, str) else ""
-        condition_lower = condition.lower() if isinstance(condition, str) else ""
-        
-        if not text_lower or not condition_lower:
-            return True
-        
-        if not negation_cues:
-            negation_cues = get_negation_cues()
-        
-        if window is None:
-            window = getattr(settings, 'ICD_MATCHING_SETTINGS', {}).get('NEGATION_WINDOW', 5)  # Tighter window
-        
-        negation_pattern = '|'.join(negation_cues)
-        pattern = rf'\b(?:{negation_pattern})\b(?:\s+\w+){{0,2}}\s+{re.escape(condition_lower)}\b'
-        if re.search(pattern, text_lower):
-            cache.set(cache_key, False, timeout=settings.ICD_MATCHING_SETTINGS['CACHE_TTL'])
+        text_lower = text.lower()
+        condition_lower = condition.lower()
+        negation_cues = negation_cues or get_negation_cues()
+        window = window or settings.ICD_MATCHING_SETTINGS.get('NEGATION_WINDOW', 10)
+
+        # Enhanced negation pattern to avoid false positives
+        negation_pattern = '|'.join(
+            rf'\b{re.escape(cue)}\b(?:\s+(?:\w+\s+){{0,5}})?{re.escape(condition_lower)}\b'
+            for cue in negation_cues
+        )
+        if re.search(negation_pattern, text_lower, re.IGNORECASE):
+            logger.debug(f"Negation detected for condition: {condition}")
+            cache.set(cache_key, False, timeout=settings.ICD_MATCHING_SETTINGS.get('CACHE_TTL', 3600))
             return False
-        
-        matches = list(re.finditer(rf'\b{re.escape(condition_lower)}\b', text_lower))
+
+        matches = list(re.finditer(rf'\b{re.escape(condition_lower)}\b', text_lower, re.IGNORECASE))
         if not matches:
-            cache.set(cache_key, True, timeout=settings.ICD_MATCHING_SETTINGS['CACHE_TTL'])
+            logger.debug(f"No matches for condition: {condition}")
+            cache.set(cache_key, True, timeout=settings.ICD_MATCHING_SETTINGS.get('CACHE_TTL', 3600))
             return True
-        
+
         for match in matches:
             start_idx = match.start()
             context_start = max(0, start_idx - window * 5)
             preceding_context = text_lower[context_start:start_idx]
-            if any(cue in preceding_context.split() for cue in negation_cues):
-                cache.set(cache_key, False, timeout=settings.ICD_MATCHING_SETTINGS['CACHE_TTL'])
+            words = preceding_context.split()
+            if any(cue in words[-window:] for cue in negation_cues):
+                logger.debug(f"Negation cue found in context for condition: {condition}")
+                cache.set(cache_key, False, timeout=settings.ICD_MATCHING_SETTINGS.get('CACHE_TTL', 3600))
                 return False
-        
-        cache.set(cache_key, True, timeout=settings.ICD_MATCHING_SETTINGS['CACHE_TTL'])
+
+        logger.debug(f"No negation for condition: {condition}")
+        cache.set(cache_key, True, timeout=settings.ICD_MATCHING_SETTINGS.get('CACHE_TTL', 3600))
         return True
     except Exception as e:
         logger.error(f"Negation check failed for condition '{condition}': {e}")
-        raise TextPreprocessingError(f"Negation check failed: {e}")
+        raise ValueError(f"Negation check failed: {e}")
 
-@retry(
-    stop=stop_after_attempt(3), 
-    wait=wait_exponential(multiplier=1, min=4, max=10),
-    retry=retry_if_exception_type((requests.RequestException, requests.Timeout, ConnectionError))
-)
-def query_mistral(prompt: str) -> str:
-    """Query the local Mistral model with retries and caching."""
-    cache_key = f"mistral_response_{hash(prompt)}"
-    cached_response = cache.get(cache_key)
-    
-    if cached_response is not None:
-        logger.debug(f"Cache hit for Mistral response: {prompt[:100]}...")
-        return cached_response
-    
-    logger.debug(f"Cache miss for Mistral response: {prompt[:100]}...")
-    
-    url = getattr(settings, 'ICD_MATCHING_SETTINGS', {}).get('MISTRAL_API_URL', "http://localhost:11434/api/generate")
-    payload = {
-        "model": "mistral", 
-        "prompt": prompt, 
-        "stream": False, 
-        "temperature": 0.1,
-    }
-    
+async def check_mistral_health() -> bool:
+    """Check if the Mistral model is available."""
     try:
-        logger.debug(f"Querying Mistral with prompt: {prompt[:100]}...")
+        url = settings.ICD_MATCHING_SETTINGS.get('MISTRAL_LOCAL_URL', 'http://localhost:11434/api/generate')
+        response = requests.get(url.replace('/generate', '/'), timeout=5)
+        response.raise_for_status()
+        logger.info("Mistral model is available")
+        return True
+    except Exception as e:
+        logger.warning(f"Mistral model health check failed: {e}")
+        return False
+    
+async def query_local_mistral(prompt: str) -> str:
+    """Query the local Mistral model."""
+    if not prompt.strip():
+        logger.warning("Empty prompt provided")
+        raise MistralQueryError("Empty prompt provided")
+
+    cache_key = f"mistral_response_{prompt[:50]}_{hash(prompt)}"
+    cached = await sync_to_async(cache.get)(cache_key)
+    if cached:
+        logger.debug(f"Cache hit for Mistral response: {prompt[:100]}...")
+        return cached
+
+    try:
+        url = settings.ICD_MATCHING_SETTINGS.get('MISTRAL_LOCAL_URL', 'http://localhost:11434/api/generate')
+        payload = {
+            "model": settings.ICD_MATCHING_SETTINGS.get('MISTRAL_MODEL', 'mistral'),
+            "prompt": prompt,
+            "options": {"temperature": 0.1, "num_predict": 500}
+        }
         response = requests.post(url, json=payload, timeout=30)
         response.raise_for_status()
-        result = response.json().get('response', '').strip()
-        cache.set(cache_key, result, timeout=settings.ICD_MATCHING_SETTINGS['CACHE_TTL'])
-        logger.debug(f"Cached Mistral response for prompt: {prompt[:100]}...")
+        result = ""
+        for line in response.iter_lines():
+            if line:
+                data = json.loads(line.decode('utf-8'))
+                result += data.get('response', '')
+        result = result.strip()
+        if not result:
+            logger.warning("Empty response from Mistral")
+            raise MistralQueryError("Empty response from Mistral")
+        await sync_to_async(cache.set)(cache_key, result, timeout=settings.ICD_MATCHING_SETTINGS.get('CACHE_TTL', 3600))
+        logger.debug(f"Cached LLM response for prompt: {prompt[:100]}...")
         return result
-    except (requests.RequestException, requests.Timeout, ConnectionError) as e:
-        logger.error(f"Mistral request failed: {e}")
-        raise MistralQueryError(f"Mistral query failed: {e}")
     except Exception as e:
-        logger.error(f"Unexpected error in Mistral query: {e}")
-        raise MistralQueryError(f"Unexpected error in Mistral query: {e}")
+        logger.error(f"Local Mistral query failed: {e}")
+        raise MistralQueryError(f"Local Mistral query failed: {e}")
 
-def generate_patient_summary(patient_text: str) -> Tuple[str, List[str]]:
-    """Generate a summary and extract conditions from patient text with status handling."""
+async def generate_patient_summary(patient_text: str) -> Tuple[str, List[str]]:
+    """Generate a summary and extract conditions using the local Mistral model."""
     if not patient_text or not isinstance(patient_text, str):
         logger.warning("No valid patient data provided")
         return "No patient data provided.", ["No conditions identified"]
-    
+
     try:
-        patient_text = preprocess_text(patient_text)
+        patient_text = await sync_to_async(preprocess_text)(patient_text)
         logger.debug(f"Preprocessed patient text: {patient_text}")
-    except TextPreprocessingError as e:
+    except Exception as e:
         logger.error(f"Text preprocessing failed: {e}")
-        raise
-    
+        raise ValueError(f"Text preprocessing failed: {e}")
+
     if not patient_text:
         return "The patient was suffering from no conditions identified.", ["No conditions identified"]
-    
+
     prompt = (
-        f"From the following patient data, generate a concise summary of the patient's condition only if those details are explicitly mentioned."
-        f" Extract all the applicable diseases, conditions, and significant symptoms "
-        f"from the text. Provide the summary in a single sentence, and list the conditions "
-        f"as a list of bullet points starting with a hyphen. Ignore negated conditions (e.g., 'no pain') but include "
-        f"non-negated symptoms like 'pain' or 'swelling'. Return summary followed by 'Conditions:' and the list.\n\n"
-        f"{patient_text}"
+        f"Analyze the following patient medical data and extract all diseases, conditions, and significant symptoms explicitly mentioned. "
+        f"Generate a concise summary in one sentence describing the patient's condition. "
+        f"List only specific, non-negated diseases or symptoms as bullet points starting with a hyphen. "
+        f"Exclude vague terms like 'conditions other than' or 'follow-up examination' unless they specify a disease. "
+        f"Ignore negated terms (e.g., 'no pain', 'denies fever') but include non-negated symptoms like 'pain' or 'swelling'. "
+        f"Recognize medical abbreviations (e.g., 'B/L' as 'bilateral', 'INV' as 'investigation') and infer relevant medical terms from context. "
+        f"Return format: Summary: <sentence>\nConditions:\n- <condition1>\n- <condition2>\n\n"
+        f"Patient data: {patient_text}"
     )
-    
+
     try:
-        mistral_response = query_mistral(prompt)
-        logger.debug(f"Mistral response: {mistral_response[:200]}...")
-        
+        mistral_response = await query_local_mistral(prompt)
+        logger.debug(f"LLM response: {mistral_response[:200]}...")
+
         if "Conditions:" in mistral_response:
             summary_part, condition_part = mistral_response.split("Conditions:", 1)
             conditions = [
@@ -154,54 +210,38 @@ def generate_patient_summary(patient_text: str) -> Tuple[str, List[str]]:
                 for line in condition_part.split('\n')
                 if line.strip().startswith('-') and line.strip('- ').strip()
             ]
-            
-            if not conditions:
-                conditions = [line.strip() for line in condition_part.split('\n') if line.strip().startswith('*')]
-                conditions = [re.sub(r'^\*\s*', '', cond).strip() for cond in conditions if cond.strip()]
-            
-            if not conditions:
-                summary_conditions = re.findall(r'suffering from\s+(.+?)(?:,|\.|$)', summary_part)
-                if summary_conditions:
-                    possible_conditions = summary_conditions[0].split(' and ')
-                    conditions = [cond.strip() for cond in possible_conditions if cond.strip()]
+            summary = summary_part.replace("Summary:", "").strip()
         else:
-            summary_part = mistral_response
-            conditions = [line.strip() for line in mistral_response.split('\n') if line.strip().startswith('-')]
-            conditions = [re.sub(r'^-+\s*', '', cond).strip() for cond in conditions if cond.strip()]
-        
-        summary = summary_part.strip()
-        
-        conditions = [cond for cond in conditions if is_not_negated(cond.split(' - ')[0], patient_text)]
-        
-        if not conditions or all(c.lower() == "no conditions identified" for c in conditions):
+            summary = mistral_response.strip()
+            conditions = [
+                re.sub(r'^-+\s*', '', line).strip()
+                for line in mistral_response.split('\n')
+                if line.strip().startswith('-') and line.strip('- ').strip()
+            ]
+
+        conditions = [
+            cond for cond in conditions
+            if await sync_to_async(is_not_negated)(cond.split(' - ')[0], patient_text)
+        ]
+
+        if not conditions:
             conditions = ["No conditions identified"]
-            if not summary.strip():
-                summary = "The patient was suffering from no conditions identified."
-    except Exception as e:
-        logger.warning(f"Mistral failed: {e}. Using fallback extraction.")
-        try:
-            words = patient_text.split()
-            conditions = []
-            for i in range(len(words)):
-                for j in range(1, min(5, len(words) - i)):
-                    phrase = ' '.join(words[i:i+j])
-                    if 2 <= len(phrase.split()) <= 4 and len(phrase) > 5 and is_not_negated(phrase, patient_text):
-                        status = 'recovered' if 'approved status' in patient_text or 'recovered' in patient_text else 'unknown'
-                        conditions.append(f"{phrase} - {status}")
-            
-            conditions = list(set(conditions))[:5]
-            
-            if not conditions:
-                conditions = ["No conditions identified"]
-            
-            summary = f"The patient was suffering from {' and '.join(c.split(' - ')[0] for c in conditions) if conditions and conditions[0] != 'No conditions identified' else 'no conditions identified'}"
-        except Exception as e:
-            logger.error(f"Fallback condition extraction failed: {e}")
-            raise ConditionExtractionError(f"Condition extraction failed: {e}")
-    
-    logger.info(f"Summary generated: {summary[:100]}...")
-    print(f"Summary: {summary}")
-    print()
-    print(f"Conditions: {conditions}")
-    logger.info(f"Conditions extracted: {conditions}")
-    return summary, conditions
+            summary = summary or "The patient was suffering from no conditions identified."
+
+        logger.info(f"Final summary: {summary[:100]}...")
+        logger.info(f"Final conditions extracted: {conditions}")
+        return summary, conditions
+    except MistralQueryError as e:
+        logger.warning(f"LLM failed: {e}. Using regex fallback.")
+        medical_terms = r'\b([a-zA-Z\s-]+(?:\s*(?:disease|disorder|syndrome|condition|pain|symptom|infection|loss))\b)'
+        conditions = [
+            match.group(0) for match in re.finditer(medical_terms, patient_text, re.IGNORECASE)
+            if await sync_to_async(is_not_negated)(match.group(0), patient_text)
+        ]
+        conditions = list(set(conditions))[:10]
+        if not conditions:
+            conditions = ["No conditions identified"]
+        summary = f"The patient was suffering from {' and '.join(conditions)}."
+        logger.info(f"Fallback summary: {summary[:100]}...")
+        logger.info(f"Fallback conditions: {conditions}")
+        return summary, conditions

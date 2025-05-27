@@ -4,6 +4,7 @@ import redis
 import json
 import django
 from datetime import datetime, timedelta
+from decouple import config
 
 # Add project root to sys.path
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -13,13 +14,18 @@ sys.path.insert(0, project_root)
 os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'icd_matcher_project.settings')
 django.setup()
 
-# Import Django model after setup
 from icd_matcher.models import MedicalAdmissionDetails
 
 def inspect_redis():
     try:
         # Connect to Redis
-        r = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
+        r = redis.Redis(
+            host=config('REDIS_HOST', default='localhost'),
+            port=config('REDIS_PORT', cast=int, default=6379),
+            db=config('REDIS_DB', cast=int, default=0),
+            decode_responses=True,
+            password=config('REDIS_PASSWORD', default=None)
+        )
         print("Connected to Redis")
 
         # List all keys
@@ -49,6 +55,9 @@ def inspect_redis():
             print("No task results found")
         for key in task_keys:
             result = r.get(key)
+            if not result:
+                print(f"{key}: No data available")
+                continue
             try:
                 decoded = json.loads(result)
                 print(f"{key}:")
@@ -56,13 +65,14 @@ def inspect_redis():
                 ttl = r.ttl(key)
                 print(f"TTL: {ttl} seconds")
                 # Correlate with database
-                task_id = decoded['task_id']
+                task_id = decoded.get('task_id')
+                if not task_id:
+                    print("No task_id available for correlation")
+                    continue
                 date_done = decoded.get('date_done', '')
                 if date_done:
                     try:
-                        # Parse date_done (ISO format: 2025-05-05T06:46:04.542845+00:00)
                         date_done_dt = datetime.fromisoformat(date_done.replace('Z', '+00:00'))
-                        # Filter records within a 1-hour range
                         start_date = date_done_dt - timedelta(hours=1)
                         end_date = date_done_dt + timedelta(hours=1)
                         records = MedicalAdmissionDetails.objects.filter(

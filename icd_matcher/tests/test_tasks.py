@@ -1,4 +1,3 @@
-# icd_matcher/tests/test_tasks.py
 import os
 import sys
 import pytest
@@ -15,11 +14,14 @@ django.setup()
 from django.test import TestCase
 from icd_matcher.models import MedicalAdmissionDetails
 from icd_matcher.tasks import predict_icd_code
+from icd_matcher.utils.db_utils import setup_fts_table
 from unittest.mock import patch
 
 @pytest.mark.django_db
 class TestPredictICDCodeTask(TestCase):
     def setUp(self):
+        # Setup FTS5 table
+        setup_fts_table()
         self.admission = MedicalAdmissionDetails.objects.create(
             patient_data="History of bilateral ureteric calculus",
             admission_date="2025-04-28"
@@ -30,12 +32,12 @@ class TestPredictICDCodeTask(TestCase):
     def test_predict_icd_code_task(self, mock_find_best_icd_match, mock_generate_patient_summary):
         # Mock dependencies
         mock_generate_patient_summary.return_value = (
-            "Ureteric calculus detected",
-            ["ureteric calculus"]
+            "The patient has a history of bilateral ureteric calculus (kidney stones in both ureters).",
+            ["Bilateral Ureteric Calculus"]
         )
         mock_find_best_icd_match.return_value = {
-            "ureteric calculus": [
-                ("N20.1", "Calculus of ureter", 92.7),
+            "Bilateral Ureteric Calculus": [
+                ("N20.1", "Calculus of ureter", 95.0),
                 ("N20.0", "Calculus of kidney", 86.3)
             ]
         }
@@ -48,12 +50,12 @@ class TestPredictICDCodeTask(TestCase):
 
         # Assertions
         assert self.admission.predicted_icd_code == "N20.1"
-        assert self.admission.prediction_accuracy == 92.7
+        assert abs(self.admission.prediction_accuracy - 95.0) < 0.1
         assert len(self.admission.predicted_icd_codes) == 2
         assert self.admission.predicted_icd_codes[0] == {
             "code": "N20.1",
-            "title": "Calculus of ureter",
-            "confidence": 92.7
+            "title": "calculus of ureter",
+            "confidence": 95.0
         }
 
     @patch("icd_matcher.tasks.generate_patient_summary")

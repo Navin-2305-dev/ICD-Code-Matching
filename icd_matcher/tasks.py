@@ -1,73 +1,76 @@
-from celery import shared_task
-from django.db import transaction
-from icd_matcher.models import MedicalAdmissionDetails
-from icd_matcher.utils.text_processing import generate_patient_summary
-from icd_matcher.utils.embeddings import find_best_icd_match
 import logging
-import re
+from celery import shared_task
+from django.core.cache import cache
+from django.conf import settings
+from icd_matcher.models import MedicalAdmissionDetails
+from icd_matcher.utils.rag_kag_pipeline import RAGKAGPipeline
+from icd_matcher.utils.exceptions import ICDMatcherError
+from asgiref.sync import sync_to_async
+import uuid
 
 logger = logging.getLogger(__name__)
 
-@shared_task(bind=True, max_retries=3)
-def predict_icd_code(self, admission_id):
-    """Celery task to predict ICD codes for a MedicalAdmissionDetails record."""
+@shared_task(
+    bind=True,
+    max_retries=3,
+    default_retry_delay=60,
+    queue='high_priority'
+)
+async def predict_icd_code(self, admission_id):
+    """Predict ICD code for a medical admission."""
+    logger.info(f"Starting ICD prediction task for admission {admission_id}")
     try:
-        with transaction.atomic():
-            admission = MedicalAdmissionDetails.objects.select_for_update().get(id=admission_id)
-            logger.info(f"Predicting ICD codes for admission {admission_id}")
-            
-            # Generate summary and conditions
-            summary, conditions = generate_patient_summary(admission.patient_data)
-            logger.debug(f"Generated conditions: {conditions}")
-            
-            # Find best ICD matches
-            icd_matches = find_best_icd_match(conditions, admission.patient_data)
-            logger.debug(f"ICD matches: {icd_matches}")
-            
-            # Collect all matches with confidence >= 60%
-            all_matches = []
-            best_code = None
-            best_score = None
-            
-            
-            for condition, matches in icd_matches.items():
-                for code, title, confidence in matches:
-                    if code and confidence >= 60:
-                        relevance_boost = 1.0
-                        title_lower = title.lower()
-                        adjusted_score = confidence * relevance_boost
-                        
-                        all_matches.append({
-                            'code': code,
-                            'title': title,
-                            'confidence': round(confidence, 1)
-                        })
-                        
-                        if best_score is None or adjusted_score > best_score:
-                            best_code = code
-                            best_score = adjusted_score
-                            best_confidence = confidence
-            
-            # Sort matches by confidence (descending)
-            all_matches.sort(key=lambda x: x['confidence'], reverse=True)
-            
-            # Update the record
-            if all_matches:
-                admission.predicted_icd_codes = all_matches
-                admission.predicted_icd_code = best_code
-                admission.prediction_accuracy = round(best_confidence, 1) if best_confidence else None
-                admission.save()
-                logger.info(f"Updated admission {admission_id} with {len(all_matches)} ICD codes, top code: {best_code} ({best_confidence}%)")
-            else:
-                logger.warning(f"No ICD codes found for admission {admission_id}")
-                admission.predicted_icd_codes = []
-                admission.predicted_icd_code = None
-                admission.prediction_accuracy = None
-                admission.save()
-                
+        admission = await sync_to_async(MedicalAdmissionDetails.objects.get)(id=admission_id)
+        cache_key = f"predict_{admission.id}_{uuid.uuid4().hex}"
+        cached_result = await sync_to_async(cache.get)(cache_key)
+        if cached_result:
+            logger.debug(f"Cache hit for prediction: {cache_key}")
+            await sync_to_async(setattr)(admission, 'predicted_icd_code', cached_result.get('predicted_icd_code', ''))
+            await sync_to_async(setattr)(admission, 'prediction_accuracy', cached_result.get('prediction_accuracy', 0.0))
+            await sync_to_async(setattr)(admission, 'predicted_icd_codes', cached_result.get('predicted_icd_codes', []))
+            await sync_to_async(admission.save)()
+            return cached_result
+
+        pipeline = await RAGKAGPipeline.create()
+        icd_matches = pipeline.run(admission.patient_data)
+        if not icd_matches:
+            logger.warning(f"No ICD matches found for admission {admission_id}")
+            return {}
+
+        top_match = None
+        top_score = 0.0
+        predicted_codes = []
+        for condition, matches in icd_matches.items():
+            for code, title, score in matches:
+                predicted_codes.append({"code": code, "title": title, "confidence": score})
+                if score > top_score:
+                    top_score = score
+                    top_match = (code, title)
+
+        result = {
+            'predicted_icd_code': top_match[0] if top_match else '',
+            'prediction_accuracy': top_score,
+            'predicted_icd_codes': predicted_codes
+        }
+
+        await sync_to_async(setattr)(admission, 'predicted_icd_code', result['predicted_icd_code'])
+        await sync_to_async(setattr)(admission, 'prediction_accuracy', result['prediction_accuracy'])
+        await sync_to_async(setattr)(admission, 'predicted_icd_codes', result['predicted_icd_codes'])
+        await sync_to_async(admission.save)()
+        
+        await sync_to_async(cache.set)(
+            cache_key,
+            result,
+            timeout=settings.ICD_MATCHING_SETTINGS.get('CACHE_TTL', 3600)
+        )
+        logger.info(f"ICD prediction completed for admission {admission_id}")
+        return result
     except MedicalAdmissionDetails.DoesNotExist:
         logger.error(f"Admission {admission_id} not found")
-        raise
+        raise self.retry()
     except Exception as e:
-        logger.error(f"Error predicting ICD codes for admission {admission_id}: {e}")
-        self.retry(countdown=60, exc=e)
+        logger.error(f"Error in ICD prediction for admission {admission_id}: {e}")
+        if self.request.retries >= self.max_retries:
+            logger.error("Max retries reached, task failed")
+            return {}
+        raise self.retry(exc=e)
