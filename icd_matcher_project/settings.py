@@ -1,7 +1,13 @@
 import os
 from pathlib import Path
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+BASE_DIR = Path(__file__).resolve().parent.parent
+
+# Ensure directories
+LOG_DIR = os.path.join(BASE_DIR, 'data/logs')
+CACHE_DIR = os.path.join(BASE_DIR, 'data/cache')
+os.makedirs(LOG_DIR, exist_ok=True)
+os.makedirs(CACHE_DIR, exist_ok=True)
 
 SECRET_KEY = 'django-insecure-46w1zzvshb#9=z+0csj6em+y)$(g#bj+qz^334*t92&cdaub+2'
 DEBUG = True
@@ -18,34 +24,46 @@ INSTALLED_APPS = [
     'icd_matcher.apps.IcdMatcherConfig',
 ]
 
+try:
+    CACHES = {
+        'default': {
+            'BACKEND': 'django_redis.cache.RedisCache',
+            'LOCATION': 'redis://localhost:6379/0',
+            'OPTIONS': {
+                'CLIENT_CLASS': 'django_redis.client.DefaultClient',
+            }
+        }
+    }
+except ImportError:
+    CACHES = {
+        'default': {
+            'BACKEND': 'django.core.cache.backends.filebased.FileBasedCache',
+            'LOCATION': CACHE_DIR,
+            'TIMEOUT': 86400,
+        }
+    }
+
 ICD_MATCHING_SETTINGS = {
     'MISTRAL_LOCAL_URL': 'http://localhost:11434/api/generate',
     'MISTRAL_MODEL': 'mistral',
-    'CACHE_TTL': 86400,  # 24 hours
+    'CACHE_TTL': 86400,
     'BATCH_SIZE': 32,
-    'FTS_QUERY_LIMIT': 10,
-    'MAX_CANDIDATES': 15,
-    'MIN_SIMILARITY_SCORE': 60,
+    'FTS_QUERY_LIMIT': 50,
+    'MAX_CANDIDATES': 20,
+    'MIN_SIMILARITY_SCORE': 50,
     'MAX_SIMILARITY_SCORE': 95,
-    'ALLOW_CATEGORY_CODES': True,
+    'ALLOW_CATEGORY_CODES': False,
     'NEGATION_WINDOW': 10,
-    'MAX_PIPELINE_ITERATIONS': 2,  # Allow one refinement iteration
+    'MAX_PIPELINE_ITERATIONS': 2,
     'PREPROCESS_CALL_LIMIT': 1000,
     'GRAPH_BUILD_BATCH_SIZE': 1000,
     'USE_RAG_KAG': True,
+    'SYNONYM_EXPANSION': True,
     'NEGATION_CUES': [
         "no", "not", "denies", "negative", "without", "absent", "ruled out",
         "non", "never", "lacks", "excludes", "rules out", "negative for",
         "free of", "deny", "denying", "unremarkable for"
-    ]
-}
-
-CACHES = {
-    'default': {
-        'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
-        'LOCATION': 'icd_matcher_cache',
-        'KEY_FUNCTION': lambda key, key_prefix, version: key.replace(':', '_').replace(' ', '_')[:250],
-    }
+    ],
 }
 
 MIDDLEWARE = [
@@ -77,7 +95,7 @@ TEMPLATES = [
 ]
 
 WSGI_APPLICATION = 'icd_matcher_project.wsgi.application'
-ASGI_APPLICATION = "icd_matcher_project.asgi.application"
+ASGI_APPLICATION = 'icd_matcher_project.asgi.application'
 
 DATABASES = {
     'default': {
@@ -87,18 +105,10 @@ DATABASES = {
 }
 
 AUTH_PASSWORD_VALIDATORS = [
-    {
-        'NAME': 'django.contrib.auth.password_validation.UserAttributeSimilarityValidator',
-    },
-    {
-        'NAME': 'django.contrib.auth.password_validation.MinimumLengthValidator',
-    },
-    {
-        'NAME': 'django.contrib.auth.password_validation.CommonPasswordValidator',
-    },
-    {
-        'NAME': 'django.contrib.auth.password_validation.NumericPasswordValidator',
-    },
+    {'NAME': 'django.contrib.auth.password_validation.UserAttributeSimilarityValidator'},
+    {'NAME': 'django.contrib.auth.password_validation.MinimumLengthValidator'},
+    {'NAME': 'django.contrib.auth.password_validation.CommonPasswordValidator'},
+    {'NAME': 'django.contrib.auth.password_validation.NumericPasswordValidator'},
 ]
 
 LOGGING = {
@@ -110,7 +120,8 @@ LOGGING = {
         },
         'file': {
             'class': 'logging.FileHandler',
-            'filename': 'icd_matcher.log',
+            'filename': os.path.join(LOG_DIR, 'icd_matcher.log'),
+            'level': 'DEBUG',
         },
     },
     'loggers': {
@@ -118,6 +129,10 @@ LOGGING = {
             'handlers': ['console', 'file'],
             'level': 'DEBUG',
             'propagate': True,
+        },
+        '': {
+            'handlers': ['console'],
+            'level': 'WARNING',
         },
     },
 }
@@ -141,3 +156,4 @@ CELERY_RESULT_SERIALIZER = 'json'
 CELERY_TIMEZONE = 'UTC'
 CELERY_TASK_TRACK_STARTED = True
 CELERY_TASK_TIME_LIMIT = 30 * 60
+CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP = True
