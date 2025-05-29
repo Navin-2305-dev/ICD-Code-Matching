@@ -22,10 +22,6 @@ class SimilarityCalculationError(Exception):
     """Raised when calculating similarity scores between embeddings fails."""
     pass
 
-class MistralQueryError(Exception):
-    """Raised when querying the Mistral model fails after retries."""
-    pass
-
 class TextPreprocessingError(Exception):
     """Raised when preprocessing text fails."""
     pass
@@ -69,4 +65,24 @@ class DatabaseError(ICDMatcherError):
     pass
 
 class DatabaseSetupError(DatabaseError):
+    pass
+
+class ICDPipelineError(Exception):
+    """Base exception for ICD pipeline errors."""
+    pass
+
+class KnowledgeGraphError(ICDPipelineError):
+    """Raised when knowledge graph operations fail."""
+    pass
+
+class EmbeddingError(ICDPipelineError):
+    """Raised when embedding operations fail."""
+    pass
+
+class DatabaseError(ICDPipelineError):
+    """Raised when database operations fail."""
+    pass
+
+class MistralQueryError(ICDPipelineError):
+    """Raised when Mistral model queries fail."""
     pass

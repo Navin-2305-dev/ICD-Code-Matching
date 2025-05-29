@@ -1,6 +1,8 @@
+import hashlib
 import logging
 import json
-from typing import List, Dict
+import re
+from typing import List, Dict, Union
 from django.shortcuts import render, get_object_or_404
 from django.core.cache import cache
 from django.conf import settings
@@ -48,13 +50,11 @@ async def patient_input(request):
                 logger.info(f"Non-negated conditions: {non_negated_conditions}")
 
                 predefined_codes = form.cleaned_data.get('predefined_icd_codes', []) or form.cleaned_data.get('predefined_icd_code', [])
-                predefined_icd_titles = await _process_predefined_codes(predefined_codes, non_negated_conditions)
-                logger.debug(f"Predefined ICD titles: {predefined_icd_titles}")
 
                 pipeline_result = {}
                 if settings.ICD_MATCHING_SETTINGS.get('USE_RAG_KAG', True):
                     pipeline = await RAGKAGPipeline.create()
-                    pipeline_result = await pipeline.run(patient_data, predefined_icd_code=predefined_codes[0] if predefined_codes else None)
+                    pipeline_result = await pipeline.run(patient_data, predefined_icd_code=predefined_codes)
                 else:
                     icd_matches = await _compute_icd_matches(non_negated_conditions, patient_data)
                     pipeline_result = {
@@ -63,7 +63,7 @@ async def patient_input(request):
                         'conditions': non_negated_conditions,
                         'icd_matches': icd_matches,
                         'all_kg_scores': {},  # Empty if not using RAG/KAG
-                        'predefined_icd_titles': predefined_icd_titles,
+                        'predefined_icd_titles': get_icd_title(predefined_codes),
                         'admission_id': None
                     }
 
@@ -87,13 +87,6 @@ async def patient_input(request):
                     prediction_accuracy = top_match[2]  # e.g., 100.0
                     predicted_icd_codes = [match[0] for match in pipeline_result['icd_matches']['Bilateral Hearing Loss']]
                 
-                # Include predefined code if provided
-                if predefined_icd_titles:
-                    predefined_code = predefined_icd_titles[0]['code']
-                    predicted_icd_codes.append(predefined_code)
-                    if not predicted_icd_code:
-                        predicted_icd_code = predefined_code
-                        prediction_accuracy = 100.0  # Assume full confidence for predefined
 
                 # Create MedicalAdmissionDetails instance
                 admission_data = {
@@ -115,7 +108,7 @@ async def patient_input(request):
                     'conditions': pipeline_result.get('conditions', non_negated_conditions),
                     'icd_matches': pipeline_result.get('icd_matches', {}),
                     'all_kg_scores': pipeline_result.get('all_kg_scores', {}),
-                    'predefined_icd_titles': pipeline_result.get('predefined_icd_titles', predefined_icd_titles),
+                    'predefined_icd_titles': pipeline_result.get('predefined_icd_titles', get_icd_title(predefined_codes)),
                     'admission_id': admission_id,
                 }
                 await sync_to_async(cache.set)(
@@ -263,7 +256,7 @@ async def predict_icd_code_view(request):
 
                 pipeline = await RAGKAGPipeline.create()
                 predefined_codes = form.cleaned_data.get('predefined_icd_codes', []) or form.cleaned_data.get('predefined_icd_code', [])
-                pipeline_result = await pipeline.run(patient_data, predefined_icd_code=predefined_codes[0] if predefined_codes else None)
+                pipeline_result = await pipeline.run(patient_data, predefined_icd_code=predefined_codes)
                 
                 summary, conditions = await generate_patient_summary(patient_data)
                 conditions = [cond for cond in conditions if cond.strip()]
@@ -277,15 +270,13 @@ async def predict_icd_code_view(request):
                     if await sync_to_async(is_not_negated)(cond, patient_data)
                 ]
                 
-                predefined_icd_titles = await _process_predefined_codes(predefined_codes, non_negated_conditions)
-                
                 result_data = {
                     'patient_data': pipeline_result.get('patient_data', patient_data),
                     'summary': pipeline_result.get('summary', summary),
                     'conditions': pipeline_result.get('conditions', non_negated_conditions),
                     'icd_matches': pipeline_result.get('icd_matches', {}),
                     'all_kg_scores': pipeline_result.get('all_kg_scores', {}),
-                    'predefined_icd_titles': pipeline_result.get('predefined_icd_titles', predefined_icd_titles),
+                    'predefined_icd_titles': pipeline_result.get('predefined_icd_titles', get_icd_title(predefined_codes)),
                     'admission_id': pipeline_result.get('admission_id', None),
                 }
                 
@@ -343,39 +334,3 @@ async def _compute_icd_matches(conditions: List[str], patient_data: str) -> Dict
             logger.error(f"Error computing matches for {condition}: {e}")
             icd_matches[condition] = []
     return icd_matches
-
-async def _process_predefined_codes(predefined_codes: List, conditions: List[str] = None) -> List[Dict[str, str]]:
-    """Process predefined ICD codes into a list of code-title pairs with relevance."""
-    if not predefined_codes:
-        return []
-    
-    if isinstance(predefined_codes, str):
-        predefined_codes = [predefined_codes]
-    
-    result = []
-    for code in predefined_codes:
-        try:
-            icd_code = str(code).strip().upper() if not isinstance(code, dict) else code.get('predefined_icd_code', '').strip().upper()
-            if icd_code:
-                title = await sync_to_async(get_icd_title)(icd_code)
-                # Determine relevance based on conditions
-                is_relevant = False
-                if conditions and title:
-                    title_lower = title.lower()
-                    is_relevant = any(
-                        cond.lower() in title_lower or any(word in title_lower for word in cond.lower().split())
-                        for cond in conditions
-                    )
-                result.append({
-                    'code': icd_code,
-                    'title': title or 'Unknown',
-                    'is_relevant': is_relevant
-                })
-        except Exception as e:
-            logger.error(f"Error processing predefined code {code}: {e}")
-            result.append({
-                'code': icd_code,
-                'title': 'Unknown',
-                'is_relevant': False
-            })
-    return result
