@@ -60,7 +60,7 @@ class RAGKAGPipeline:
             self.is_initialized = True
             logger.info("RAGKAGPipeline initialized successfully")
         except Exception as e:
-            logger.error(f"Error initializing RAGKAGPipeline: {e}")
+            logger.error(f"Error initializing pipeline: {e}")
             raise
 
     async def _preprocess_node(self, state: GraphState) -> GraphState:
@@ -68,72 +68,78 @@ class RAGKAGPipeline:
         logger.debug("Preprocessing node")
         patient_text = state.get("patient_text", "").strip()
         if not patient_text:
-            logger.warning("Empty patient text provided")
+            logger.warning("No patient text provided")
             state["preprocessed_text"] = ""
             return state
 
         try:
             preprocessed_text = await sync_to_async(preprocess_text)(patient_text)
             state["preprocessed_text"] = preprocessed_text
-            logger.info(f"Preprocessed text: {preprocessed_text[:100]}...")
+            logger.info(f"Patient text preprocessed: {preprocessed_text[:100]}...")
         except Exception as e:
-            logger.error(f"Preprocessing failed: {e}")
-            state["preprocessed_text"] = ""
+            logger.error(f"Failed to preprocess text: {e}")
+            state["preprocessed_text"] = patient_text  # Fallback to original text
         return state
 
     async def _retrieve_node(self, state: GraphState) -> GraphState:
-        """Retrieve relevant ICD codes using Knowledge Graph."""
-        logger.debug("Retrieval node")
-        preprocessed_text = state.get("preprocessed_text", "")
-        conditions = [cond for cond in state.get("conditions", []) if cond.strip()]
+        """Retrieve ICD codes from knowledge graph."""
+        logger.debug("Retrieving from knowledge graph")
+        preprocessed_text = state.get('preprocessed_text', '')
+        conditions = [c.strip() for c in state.get('conditions', []) if c.strip()]
 
         if not preprocessed_text or not conditions:
-            logger.warning("No preprocessed text or valid conditions for retrieval")
-            state["kg_results"] = []
+            logger.warning("No text or conditions for retrieval")
+            state['kg_results'] = []
             return state
 
         try:
-            kg_codes = []
+            kg_codes = set()
             for condition in conditions:
                 related_codes = await self.knowledge_graph.query(condition)
-                kg_codes.extend(related_codes)
-            kg_codes = list(set(kg_codes))
+                kg_codes.update(related_codes)
 
             expanded_codes = []
             for code in kg_codes:
                 if '-' in code:
                     start, end = code.split('-')
                     start_letter = start[0]
-                    start_num = int(start[1:]) if start[1:].isdigit() else 0
-                    end_num = int(end[1:]) if end[1:].isdigit() else 0
-                    for i in range(start_num, end_num + 1):
-                        expanded_code = f"{start_letter}{i}"
-                        if expanded_code not in expanded_codes and expanded_code in self.knowledge_graph.graph:
-                            expanded_codes.append(expanded_code)
+                    try:
+                        start_num = int(start[1:]) if start[1:].isdigit() else 0
+                        end_num = int(end[1:]) if end[1:].isdigit() else 0
+                        for i in range(start_num, end_num + 1):
+                            expanded_code = f"{start_letter}{i}"
+                            if expanded_code not in expanded_codes and expanded_code in self.knowledge_graph.graph:
+                                expanded_codes.append(expanded_code)
+                    except ValueError:
+                        logger.warning(f"Invalid code range: {code}")
+                        continue
                 else:
                     if code not in expanded_codes:
                         expanded_codes.append(code)
 
-            kg_codes = expanded_codes
             kg_results = await sync_to_async(
                 lambda: list(
-                    ICDCategory.objects.filter(code__in=kg_codes).values('code', 'title')
+                    ICDCategory.objects.filter(code__in=expanded_codes).values('code', 'title')
                 )
             )()
-            kg_results = [(item['code'], item['title']) for item in kg_results if item['title']]
-
-            state["kg_results"] = kg_results
-            logger.info(f"Retrieved {len(kg_results)} Knowledge Graph results")
+            state["kg_results"] = [(item['code'], item['title']) for item in kg_results if item['title']]
+            logger.info(f"Retrieved {len(kg_results)} knowledge graph results")
         except Exception as e:
             logger.error(f"Retrieval failed: {e}")
-            state["kg_results"] = []
+            state['kg_results'] = []
         return state
 
     async def _generate_node(self, state: GraphState) -> GraphState:
-        """Generate final ICD matches and compute similarity scores for all Knowledge Graph results."""
-        logger.debug("Generation node")
-        conditions = [cond for cond in state.get("conditions", []) if cond.strip()]
-        kg_results = state.get("kg_results", [])
+        """Generate ICD matches with similarity scores."""
+        logger.debug("Generating ICD matches")
+        conditions = [c.strip() for c in state.get('conditions', []) if c.strip()]
+        kg_results = state.get('kg_results', [])
+
+        if not conditions or not kg_results:
+            logger.warning("No conditions or KG results for generation")
+            state['icd_matches'] = {c: [] for c in conditions} if conditions else {}
+            state['all_kg_scores'] = {c: [] for c in conditions} if conditions else {}
+            return state
 
         icd_matches = {}
         all_kg_scores = {}
@@ -141,9 +147,8 @@ class RAGKAGPipeline:
             try:
                 norm_cond = condition.lower().strip()
                 condition_terms = norm_cond.split()
-                expanded_terms = []
+                expanded_terms = condition_terms.copy()
                 for term in condition_terms:
-                    expanded_terms.append(term)
                     for key, values in self.knowledge_graph.synonyms.items():
                         if term == key:
                             expanded_terms.extend(values)
@@ -173,20 +178,16 @@ class RAGKAGPipeline:
                         continue
                     filtered_results.append((code, title, score))
 
-                filtered_results = filtered_results
                 icd_matches[condition] = filtered_results
-
-                logger.debug(f"All Knowledge Graph scores for {condition}: {all_kg_scores[condition]}")
-                logger.debug(f"ICD matches for {condition}: {icd_matches[condition]}")
+                logger.debug(f"Matches for {condition}: {filtered_results}")
             except Exception as e:
-                logger.error(f"Generation failed for condition {condition}: {e}")
+                logger.error(f"Generation failed for {condition}: {e}")
                 icd_matches[condition] = []
                 all_kg_scores[condition] = []
 
-        state["icd_matches"] = icd_matches
-        state["all_kg_scores"] = all_kg_scores
+        state['icd_matches'] = icd_matches
+        state['all_kg_scores'] = all_kg_scores
         logger.info(f"Generated ICD matches: {icd_matches}")
-        logger.info(f"All Knowledge Graph scores: {all_kg_scores}")
         return state
 
     @retry(stop=stop_after_attempt(3), wait=wait_fixed(1))
@@ -194,62 +195,63 @@ class RAGKAGPipeline:
         """Run the pipeline asynchronously."""
         logger.debug(f"Running pipeline for patient text: {patient_text[:100]}...")
         try:
-            state = {"patient_text": patient_text.strip()}
-            if not state["patient_text"]:
+            if not patient_text.strip():
                 logger.warning("Empty patient text provided")
                 return {}
 
             summary, conditions = await generate_patient_summary(patient_text)
-            state["summary"] = summary
-            state["conditions"] = conditions
+            state = {
+                'patient_text': patient_text,
+                'summary': summary,
+                'conditions': [c for c in conditions if c.strip() and c != "No conditions identified"],
+                'kg_results': [],
+                'icd_matches': {},
+                'all_kg_scores': {}
+            }
+
+            if not state['conditions']:
+                logger.warning("No valid conditions identified")
+                return state
 
             if not self.is_initialized:
                 await self._initialize()
 
             result = await self.graph.ainvoke(state)
-            icd_matches = result.get("icd_matches", {})
-            all_kg_scores = result.get("all_kg_scores", {})
+            icd_matches = result.get('icd_matches', {})
+            all_kg_scores = result.get('all_kg_scores', {})
 
             predefined_icd_titles = []
             if predefined_icd_code:
                 try:
-                    icd_title = await sync_to_async(get_icd_title)(predefined_icd_code)
-                    if icd_title:
-                        is_relevant = any(
-                            predefined_icd_code in [match[0] for match in matches]
-                            for matches in icd_matches.values()
-                        )
-                        predefined_icd_titles.append({
-                            "code": predefined_icd_code,
-                            "title": icd_title,
-                            "is_relevant": is_relevant
-                        })
-                    else:
-                        logger.warning(f"No title found for predefined ICD code: {predefined_icd_code}")
-                        predefined_icd_titles.append({
-                            "code": predefined_icd_code,
-                            "title": "Unknown",
-                            "is_relevant": False
-                        })
+                    icd_title = await get_icd_title(predefined_icd_code)  # Already async
+                    is_relevant = any(
+                        predefined_icd_code in [m[0] for m in matches]
+                        for matches in icd_matches.values()
+                    )
+                    predefined_icd_titles.append({
+                        'code': predefined_icd_code,
+                        'title': icd_title or 'Unknown',
+                        'is_relevant': is_relevant
+                    })
                 except Exception as e:
                     logger.error(f"Error processing predefined code {predefined_icd_code}: {e}")
                     predefined_icd_titles.append({
-                        "code": predefined_icd_code,
-                        "title": "Unknown",
-                        "is_relevant": False
+                        'code': predefined_icd_code,
+                        'title': 'Unknown',
+                        'is_relevant': False
                     })
 
-            logger.info(f"Pipeline completed with matches: {icd_matches}")
-            logger.info(f"All Knowledge Graph scores: {all_kg_scores}")
-            return {
-                "patient_data": patient_text,
-                "summary": summary,
-                "conditions": conditions,
-                "icd_matches": icd_matches,
-                "all_kg_scores": all_kg_scores,
-                "predefined_icd_titles": predefined_icd_titles,
-                "admission_id": "61"  # Updated based on latest log
+            result = {
+                'patient_data': patient_text,
+                'summary': summary,
+                'conditions': state['conditions'],
+                'icd_matches': icd_matches,
+                'all_kg_scores': all_kg_scores,
+                'predefined_icd_titles': predefined_icd_titles,
+                'admission_id': '61'  # Placeholder, updated dynamically
             }
+            logger.info(f"Pipeline completed with matches: {icd_matches}")
+            return result
         except Exception as e:
-            logger.error(f"Error running pipeline: {e}")
+            logger.error(f"Pipeline execution failed: {e}")
             raise

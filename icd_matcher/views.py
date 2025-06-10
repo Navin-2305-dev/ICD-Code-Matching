@@ -1,8 +1,7 @@
 import hashlib
 import logging
 import json
-import re
-from typing import List, Dict, Union
+from typing import List, Dict, Tuple
 from django.shortcuts import render, get_object_or_404
 from django.core.cache import cache
 from django.conf import settings
@@ -15,7 +14,6 @@ from icd_matcher.utils.embeddings import find_best_icd_match
 from icd_matcher.utils.text_processing import generate_patient_summary, is_not_negated, reset_preprocess_counter
 from icd_matcher.utils.db_utils import get_icd_title
 from icd_matcher.utils.rag_kag_pipeline import RAGKAGPipeline
-import uuid
 
 logger = logging.getLogger(__name__)
 
@@ -34,10 +32,9 @@ async def patient_input(request):
                     form.add_error(None, "Please provide valid patient data")
                     return await sync_to_async(render)(request, 'patient_input.html', {'form': form})
 
-                logger.info(f"Patient data: {patient_data}")
+                logger.info(f"Patient data: {patient_data[:200]}")
                 summary, conditions = await generate_patient_summary(patient_data)
-                # Filter out empty or invalid conditions
-                conditions = [cond for cond in conditions if cond.strip()]
+                conditions = [cond for cond in conditions if cond.strip() and cond != "No conditions identified"]
                 if not conditions:
                     logger.warning("No valid conditions identified from patient data")
                     form.add_error(None, "No specific conditions identified. Please provide detailed medical information.")
@@ -50,11 +47,13 @@ async def patient_input(request):
                 logger.info(f"Non-negated conditions: {non_negated_conditions}")
 
                 predefined_codes = form.cleaned_data.get('predefined_icd_codes', []) or form.cleaned_data.get('predefined_icd_code', [])
+                if isinstance(predefined_codes, str):
+                    predefined_codes = [predefined_codes]
 
                 pipeline_result = {}
                 if settings.ICD_MATCHING_SETTINGS.get('USE_RAG_KAG', True):
                     pipeline = await RAGKAGPipeline.create()
-                    pipeline_result = await pipeline.run(patient_data, predefined_icd_code=predefined_codes)
+                    pipeline_result = await pipeline.run(patient_data, predefined_codes[0] if predefined_codes else None)
                 else:
                     icd_matches = await _compute_icd_matches(non_negated_conditions, patient_data)
                     pipeline_result = {
@@ -62,31 +61,40 @@ async def patient_input(request):
                         'summary': summary,
                         'conditions': non_negated_conditions,
                         'icd_matches': icd_matches,
-                        'all_kg_scores': {},  # Empty if not using RAG/KAG
-                        'predefined_icd_titles': get_icd_title(predefined_codes),
+                        'all_kg_scores': {},
+                        'predefined_icd_titles': [
+                            {
+                                'code': code,
+                                'title': await get_icd_title(code) or 'Unknown',
+                                'is_relevant': False
+                            } for code in predefined_codes
+                        ],
                         'admission_id': None
                     }
 
                 # Prepare admission data
                 patient_data_json = {
-                    'admission_type': form.cleaned_data.get('ADMISSION_TYPE'),
-                    'admission_status': form.cleaned_data.get('ADMISSION_STATUS'),
-                    'discharge_ward': form.cleaned_data.get('DISCHARGE_WARD'),
-                    'icd_remarks_admission': form.cleaned_data.get('ICD_REMARKS_A'),
-                    'icd_remarks_discharge': form.cleaned_data.get('ICD_REMARKS_D'),
+                    'admission_type': form.cleaned_data.get('ADMISSION_TYPE', ''),
+                    'admission_status': form.cleaned_data.get('ADMISSION_STATUS', ''),
+                    'discharge_ward': form.cleaned_data.get('DISCHARGE_WARD', ''),
+                    'icd_remarks_admission': form.cleaned_data.get('ICD_REMARKS_A', ''),
+                    'icd_remarks_discharge': form.cleaned_data.get('ICD_REMARKS_D', ''),
                 }
-                
+
                 # Determine predicted ICD code and accuracy
                 predicted_icd_code = None
                 prediction_accuracy = 0.0
                 predicted_icd_codes = []
-                
-                if pipeline_result.get('icd_matches', {}).get('Bilateral Hearing Loss'):
-                    top_match = pipeline_result['icd_matches']['Bilateral Hearing Loss'][0]
-                    predicted_icd_code = top_match[0]  # e.g., 'H90.0'
-                    prediction_accuracy = top_match[2]  # e.g., 100.0
-                    predicted_icd_codes = [match[0] for match in pipeline_result['icd_matches']['Bilateral Hearing Loss']]
-                
+                icd_matches = pipeline_result.get('icd_matches', {})
+                if icd_matches:
+                    top_score = 0.0
+                    for condition, matches in icd_matches.items():
+                        for code, title, score in matches:
+                            predicted_icd_codes.append({'code': code, 'title': title, 'confidence': score})
+                            if score > top_score:
+                                top_score = score
+                                predicted_icd_code = code
+                                prediction_accuracy = score
 
                 # Create MedicalAdmissionDetails instance
                 admission_data = {
@@ -101,14 +109,16 @@ async def patient_input(request):
                 admission_id = str(admission.id)
                 pipeline_result['admission_id'] = admission_id
 
-                cache_key = f"patient_result_{admission_id}_{uuid.uuid4().hex}"
+                # Cache results with deterministic key
+                data_hash = hashlib.sha256(json.dumps(pipeline_result, sort_keys=True).encode()).hexdigest()
+                cache_key = f"patient_result_{admission_id}_{data_hash}_v1"
                 result_data = {
                     'patient_data': pipeline_result.get('patient_data', patient_data),
                     'summary': pipeline_result.get('summary', summary),
                     'conditions': pipeline_result.get('conditions', non_negated_conditions),
-                    'icd_matches': pipeline_result.get('icd_matches', {}),
+                    'icd_matches': icd_matches,
                     'all_kg_scores': pipeline_result.get('all_kg_scores', {}),
-                    'predefined_icd_titles': pipeline_result.get('predefined_icd_titles', get_icd_title(predefined_codes)),
+                    'predefined_icd_titles': pipeline_result.get('predefined_icd_titles', []),
                     'admission_id': admission_id,
                 }
                 await sync_to_async(cache.set)(
@@ -142,7 +152,7 @@ async def result(request):
             'error': 'No admission ID provided'
         })
 
-    cache_key_pattern = f"patient_result_{admission_id}_*"
+    cache_key_pattern = f"patient_result_{admission_id}_*_v1"
     keys = await sync_to_async(cache.keys)(cache_key_pattern)
     if not keys:
         logger.warning(f"No cached results found for admission_id: {admission_id}")
@@ -187,7 +197,8 @@ async def admission_details_view(request, admission_id):
     """Display details for a specific admission."""
     try:
         admission = await sync_to_async(get_object_or_404)(MedicalAdmissionDetails, id=admission_id)
-        cache_key = f"patient_result_{admission_id}_{uuid.uuid4().hex}"
+        data_hash = hashlib.sha256(admission.patient_data.encode()).hexdigest()
+        cache_key = f"patient_result_{admission_id}_{data_hash}_v1"
         result_data = await sync_to_async(cache.get)(cache_key)
 
         if not result_data:
@@ -200,7 +211,7 @@ async def admission_details_view(request, admission_id):
                 'ADMISSION_STATUS': json.loads(admission.patient_data).get('admission_status', ''),
             })
             summary, conditions = await generate_patient_summary(patient_data)
-            conditions = [cond for cond in conditions if cond.strip()]
+            conditions = [cond for cond in conditions if cond.strip() and cond != "No conditions identified"]
             non_negated_conditions = [
                 cond for cond in conditions
                 if await sync_to_async(is_not_negated)(cond, patient_data)
@@ -209,9 +220,12 @@ async def admission_details_view(request, admission_id):
             pipeline_result = await pipeline.run(patient_data)
             predefined_icd_titles = [
                 {
-                    'code': code,
-                    'title': await sync_to_async(get_icd_title)(code) or 'Unknown',
-                    'is_relevant': False  # Simplified for this view; can be enhanced to check relevance
+                    'code': code.get('code', ''),
+                    'title': await get_icd_title(code.get('code', '')) or 'Unknown',
+                    'is_relevant': any(
+                        code.get('code', '') in [m[0] for m in matches]
+                        for matches in pipeline_result.get('icd_matches', {}).values()
+                    )
                 }
                 for code in admission.predicted_icd_codes or []
             ]
@@ -221,7 +235,7 @@ async def admission_details_view(request, admission_id):
                 'conditions': pipeline_result.get('conditions', non_negated_conditions),
                 'icd_matches': pipeline_result.get('icd_matches', {}),
                 'all_kg_scores': pipeline_result.get('all_kg_scores', {}),
-                'predefined_icd_titles': pipeline_result.get('predefined_icd_titles', predefined_icd_titles),
+                'predefined_icd_titles': predefined_icd_titles,
                 'admission_id': str(admission_id),
             }
             await sync_to_async(cache.set)(
@@ -242,7 +256,6 @@ async def predict_icd_code_view(request):
     """Handle ICD code prediction view."""
     reset_preprocess_counter()
     logger.debug("Processing ICD prediction request")
-    
     if request.method == 'POST':
         form = PatientInputForm(request.POST)
         if form.is_valid():
@@ -256,10 +269,12 @@ async def predict_icd_code_view(request):
 
                 pipeline = await RAGKAGPipeline.create()
                 predefined_codes = form.cleaned_data.get('predefined_icd_codes', []) or form.cleaned_data.get('predefined_icd_code', [])
-                pipeline_result = await pipeline.run(patient_data, predefined_icd_code=predefined_codes)
+                if isinstance(predefined_codes, str):
+                    predefined_codes = [predefined_codes]
+                pipeline_result = await pipeline.run(patient_data, predefined_codes[0] if predefined_codes else None)
                 
                 summary, conditions = await generate_patient_summary(patient_data)
-                conditions = [cond for cond in conditions if cond.strip()]
+                conditions = [cond for cond in conditions if cond.strip() and cond != "No conditions identified"]
                 if not conditions:
                     logger.warning("No valid conditions identified from patient data")
                     form.add_error(None, "No specific conditions identified. Please provide detailed medical information.")
@@ -276,7 +291,7 @@ async def predict_icd_code_view(request):
                     'conditions': pipeline_result.get('conditions', non_negated_conditions),
                     'icd_matches': pipeline_result.get('icd_matches', {}),
                     'all_kg_scores': pipeline_result.get('all_kg_scores', {}),
-                    'predefined_icd_titles': pipeline_result.get('predefined_icd_titles', get_icd_title(predefined_codes)),
+                    'predefined_icd_titles': pipeline_result.get('predefined_icd_titles', []),
                     'admission_id': pipeline_result.get('admission_id', None),
                 }
                 
@@ -298,14 +313,14 @@ async def predict_icd_code_view(request):
 
 def _format_patient_text(form_data: Dict) -> str:
     """Format patient data into a consistent string."""
-    form_data = {k.lower(): v for k, v in form_data.items()}
+    form_data_lower = {k.lower(): v for k, v in form_data.items()}
     
-    remarks_a = form_data.get('icd_remarks_a', form_data.get('icd_remarks_admission', '')).strip()
-    remarks_d = form_data.get('icd_remarks_d', form_data.get('icd_remarks_discharge', '')).strip()
-    admission_date = form_data.get('admission_date', '')
-    admission_type = form_data.get('admission_type', '')
-    admission_status = form_data.get('admission_status', '')
-    discharge_ward = form_data.get('discharge_ward', '')
+    remarks_a = form_data_lower.get('icd_remarks_a', form_data_lower.get('icd_remarks_admission', '')).strip()
+    remarks_d = form_data_lower.get('icd_remarks_d', form_data_lower.get('icd_remarks_discharge', '')).strip()
+    admission_date = form_data_lower.get('admission_date', '')
+    admission_type = form_data_lower.get('admission_type', '')
+    admission_status = form_data_lower.get('admission_status', '')
+    discharge_ward = form_data_lower.get('discharge_ward', '')
     
     patient_text = []
     if remarks_a:
@@ -317,20 +332,21 @@ def _format_patient_text(form_data: Dict) -> str:
     if admission_type:
         patient_text.append(f"Admission Type: {admission_type}")
     if admission_date:
-        patient_text.append(f"Admission Date: {admission_date}")
+        patient_text.append(str(admission_date))
     if admission_status:
         patient_text.append(f"Admission Status: {admission_status}")
     
     return " ".join(patient_text)
 
-async def _compute_icd_matches(conditions: List[str], patient_data: str) -> Dict[str, List[tuple]]:
+async def _compute_icd_matches(conditions: List[str], patient_data: str) -> Dict[str, List[Tuple[str, str, float]]]:
     """Compute ICD matches without RAG/KAG pipeline."""
     icd_matches = {}
     for condition in conditions:
         try:
-            matches = await sync_to_async(find_best_icd_match)([condition], patient_data)
+            matches = await find_best_icd_match([condition], patient_data)
             icd_matches[condition] = matches.get(condition, [])
+            logger.debug(f"Computed matches for {condition}: {icd_matches[condition]}")
         except Exception as e:
-            logger.error(f"Error computing matches for {condition}: {e}")
+            logger.error(f"Error computing ICD matches for condition '{condition}': {e}")
             icd_matches[condition] = []
     return icd_matches

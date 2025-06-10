@@ -1,5 +1,6 @@
 import logging
 import re
+import hashlib
 from typing import List, Tuple, Optional
 from django.core.cache import cache
 from django.conf import settings
@@ -8,6 +9,7 @@ import requests
 import json
 from threading import local
 from icd_matcher.utils.exceptions import MistralQueryError
+from tenacity import retry, stop_after_attempt, wait_fixed
 
 logger = logging.getLogger(__name__)
 _thread_local = local()
@@ -45,7 +47,9 @@ def preprocess_text(text: str, bypass_counter_limit: bool = False) -> str:
             logger.error("Excessive preprocess_text calls detected, possible loop")
             raise RuntimeError("Excessive preprocess_text calls")
 
-    cache_key = f"preprocessed_text_{hash(text[:1000])}_{text[:50]}"
+    # Use deterministic cache key
+    text_hash = hashlib.sha256(text[:1000].encode()).hexdigest()
+    cache_key = f"preprocessed_text_{text_hash}"
     cached_text = cache.get(cache_key)
     if cached_text is not None:
         logger.debug(f"Cache hit for preprocess_text: {text[:200]}")
@@ -78,7 +82,9 @@ def is_not_negated(condition: str, text: str, negation_cues: Optional[List[str]]
         logger.debug("No condition or text, returning True")
         return True
 
-    cache_key = f"negation_check_{condition[:50]}_{hash(text[:1000])}"
+    condition_hash = hashlib.sha256(condition[:50].encode()).hexdigest()
+    text_hash = hashlib.sha256(text[:1000].encode()).hexdigest()
+    cache_key = f"negation_check_{condition_hash}_{text_hash}"
     cached_result = cache.get(cache_key)
     if cached_result is not None:
         logger.debug(f"Cache hit for negation check: {condition} -> {cached_result}")
@@ -90,7 +96,6 @@ def is_not_negated(condition: str, text: str, negation_cues: Optional[List[str]]
         negation_cues = negation_cues or get_negation_cues()
         window = window or settings.ICD_MATCHING_SETTINGS.get('NEGATION_WINDOW', 10)
 
-        # Enhanced negation pattern to avoid false positives
         negation_pattern = '|'.join(
             rf'\b{re.escape(cue)}\b(?:\s+(?:\w+\s+){{0,5}})?{re.escape(condition_lower)}\b'
             for cue in negation_cues
@@ -134,14 +139,16 @@ async def check_mistral_health() -> bool:
     except Exception as e:
         logger.warning(f"Mistral model health check failed: {e}")
         return False
-    
+
+@retry(stop=stop_after_attempt(3), wait=wait_fixed(1))
 async def query_local_mistral(prompt: str) -> str:
     """Query the local Mistral model."""
     if not prompt.strip():
         logger.warning("Empty prompt provided")
         raise MistralQueryError("Empty prompt provided")
 
-    cache_key = f"mistral_response_{prompt[:50]}_{hash(prompt)}"
+    prompt_hash = hashlib.sha256(prompt.encode()).hexdigest()
+    cache_key = f"mistral_response_{prompt_hash}"
     cached = await sync_to_async(cache.get)(cache_key)
     if cached:
         logger.debug(f"Cache hit for Mistral response: {prompt[:100]}...")
@@ -160,7 +167,10 @@ async def query_local_mistral(prompt: str) -> str:
         for line in response.iter_lines():
             if line:
                 data = json.loads(line.decode('utf-8'))
-                result += data.get('response', '')
+                if 'response' not in data:
+                    logger.warning("Invalid response format from Mistral")
+                    raise MistralQueryError("Invalid response format")
+                result += data['response']
         result = result.strip()
         if not result:
             logger.warning("Empty response from Mistral")
