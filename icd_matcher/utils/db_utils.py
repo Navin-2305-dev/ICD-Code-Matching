@@ -8,13 +8,11 @@ from django.conf import settings
 from icd_matcher.models import ICDCategory
 from icd_matcher.utils.exceptions import FTSQueryError, ICDTitleRetrievalError
 from asgiref.sync import sync_to_async
-
 from icd_matcher.utils.text_processing import preprocess_text
 
 logger = logging.getLogger(__name__)
 
 async def setup_fts_table():
-    """Set up the FTS5 table for ICD matching with triggers."""
     logger.info("Setting up FTS5 table for ICD matching")
     try:
         async with connection.cursor() as cursor:
@@ -25,18 +23,19 @@ async def setup_fts_table():
                     title,
                     inclusions,
                     exclusions,
+                    clinical_notes,
                     tokenize='porter unicode61'
                 )
             """)
             await cursor.execute("""
-                INSERT INTO icd_fts(code, title, inclusions, exclusions)
-                SELECT code, title, inclusions, exclusions FROM icd_matcher_icdcategory
+                INSERT INTO icd_fts(code, title, inclusions, exclusions, clinical_notes)
+                SELECT code, title, inclusions, exclusions, clinical_notes FROM icd_matcher_icdcategory
             """)
             await cursor.execute("""
                 CREATE TRIGGER icd_ai AFTER INSERT ON icd_matcher_icdcategory
                 BEGIN
-                    INSERT INTO icd_fts(code, title, inclusions, exclusions)
-                    VALUES (NEW.code, NEW.title, NEW.inclusions, NEW.exclusions);
+                    INSERT INTO icd_fts(code, title, inclusions, exclusions, clinical_notes)
+                    VALUES (NEW.code, NEW.title, NEW.inclusions, NEW.exclusions, NEW.clinical_notes);
                 END
             """)
             await cursor.execute("""
@@ -48,7 +47,8 @@ async def setup_fts_table():
             await cursor.execute("""
                 CREATE TRIGGER icd_au AFTER UPDATE ON icd_matcher_icdcategory
                 BEGIN
-                    UPDATE icd_fts SET title = NEW.title, inclusions = NEW.inclusions, exclusions = NEW.exclusions
+                    UPDATE icd_fts SET title = NEW.title, inclusions = NEW.inclusions, 
+                    exclusions = NEW.exclusions, clinical_notes = NEW.clinical_notes
                     WHERE code = NEW.code;
                 END
             """)
@@ -58,7 +58,6 @@ async def setup_fts_table():
         raise ValueError(f"FTS5 table setup failed: {e}")
 
 async def get_icd_title(code: str) -> str:
-    """Retrieve the title for an ICD code."""
     if not code:
         return None
 
@@ -81,16 +80,15 @@ async def get_icd_title(code: str) -> str:
         return None
 
 async def execute_fts_query(query: str, limit: int = 20) -> list:
-    """Execute a full-text search query on ICD categories using SQLite."""
     try:
-        query = (await sync_to_async(preprocess_text)(query)).lower().strip()
+        query = (await preprocess_text(query)).lower().strip()
         if not query:
             return []
 
         terms = query.split()
         query_conditions = Q()
         for term in terms:
-            query_conditions &= (Q(title__icontains=term) | Q(inclusions__icontains=term))
+            query_conditions &= (Q(title__icontains=term) | Q(inclusions__icontains=term) | Q(clinical_notes__icontains=term))
 
         results = await sync_to_async(
             lambda: list(ICDCategory.objects.filter(query_conditions).values('code', 'title')[:limit])
@@ -99,7 +97,7 @@ async def execute_fts_query(query: str, limit: int = 20) -> list:
         if len(results) < limit:
             broad_conditions = Q()
             for term in terms:
-                broad_conditions |= Q(title__icontains=term) | Q(inclusions__icontains=term)
+                broad_conditions |= Q(title__icontains=term) | Q(inclusions__icontains=term) | Q(clinical_notes__icontains=term)
             additional_results = await sync_to_async(
                 lambda: list(
                     ICDCategory.objects.filter(broad_conditions)

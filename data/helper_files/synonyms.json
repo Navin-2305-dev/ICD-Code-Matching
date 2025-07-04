@@ -1,0 +1,58 @@
+{
+    "bilateral hearing loss": [
+        "hearing loss in both ears",
+        "bilateral deafness",
+        "bilateral hearing impairment",
+        "dual ear hearing loss",
+        "both ears hearing impairment"
+    ],
+    "hypertension": [
+        "high blood pressure",
+        "elevated blood pressure",
+        "hypertensive disease",
+        "primary hypertension",
+        "essential hypertension"
+    ],
+    "diabetes mellitus": [
+        "diabetes",
+        "type 2 diabetes",
+        "sugar diabetes",
+        "hyperglycemia",
+        "insulin-dependent diabetes"
+    ],
+    "chest pain": [
+        "thoracic pain",
+        "angina",
+        "chest discomfort",
+        "pectoral pain",
+        "cardiac pain"
+    ],
+    "febrile seizure": [
+        "febrile convulsion",
+        "fever seizure",
+        "febrile fit",
+        "seizure due to fever",
+        "recurrent febrile seizure"
+    ],
+    "status epilepticus": [
+        "prolonged seizure",
+        "continuous seizure",
+        "persistent seizure",
+        "epileptic status"
+    ],
+    "bilateral ureter calculus": [
+        "Bilateral kidney stones",
+        "Dual ureteral calculi",
+        "Simultaneous ureteric calculi in both kidneys",
+        "Two-sided ureteral calculus",
+        "Both-kidney ureteral calculi"
+    ],
+    "bilateral hearing los": [
+        "Bilateral Deafness",
+        "Symmetrical Hearing Loss",
+        "Both-Sided Hearing Impairment",
+        "Asymptomatic Sensorineural Hearing Loss (SNHL) - Bilateral",
+        "Conductive Hearing Loss - Bilateral",
+        "Mixed Hearing Loss - Bilateral"
+    ]
+}

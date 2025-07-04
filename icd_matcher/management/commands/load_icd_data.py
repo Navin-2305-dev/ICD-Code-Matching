@@ -25,10 +25,9 @@ class Command(BaseCommand):
             help='Perform incremental update instead of clearing the database'
         )
 
-    def expand_range(self, code_range: str, base_title: str) -> List[Tuple[str, str, List, List]]:
-        """Expand an ICD code range (e.g., A00-A09) into individual codes."""
+    def expand_range(self, code_range: str, base_title: str, inclusions: List, exclusions: List) -> List[Tuple[str, str, List, List]]:
         if '-' not in code_range:
-            return [(code_range, base_title, [], [])]
+            return [(code_range, base_title, inclusions, exclusions)]
 
         start, end = code_range.split('-')
         start_match = re.match(r'([A-Za-z]+)(\d+)', start)
@@ -36,58 +35,81 @@ class Command(BaseCommand):
 
         if not (start_match and end_match):
             logger.warning(f"Invalid range format: {code_range}")
-            return [(code_range, base_title, [], [])]
+            return [(code_range, base_title, inclusions, exclusions)]
 
         start_letter, start_num = start_match.groups()
         end_letter, end_num = end_match.groups()
 
         if start_letter != end_letter:
             logger.warning(f"Mismatched letters in range: {code_range}")
-            return [(code_range, base_title, [], [])]
+            return [(code_range, base_title, inclusions, exclusions)]
 
         try:
             start_num, end_num = int(start_num), int(end_num)
         except ValueError:
             logger.warning(f"Non-numeric range values: {code_range}")
-            return [(code_range, base_title, [], [])]
+            return [(code_range, base_title, inclusions, exclusions)]
 
         codes = []
         for num in range(start_num, end_num + 1):
             code = f"{start_letter}{num:02d}"
             title = f"{base_title} ({code})"
-            codes.append((code, title, [], []))
+            codes.append((code, title, inclusions, exclusions))
         return codes
 
-    def collect_categories(self, item: Dict, parent_code: str = None, seen_codes: set = None) -> List[Dict]:
-        """Flatten JSON hierarchy into a list of category records, avoiding duplicates."""
+    def normalize_field(self, field_value) -> List:
+        """Ensure the field is a list, handling all edge cases."""
+        if isinstance(field_value, list):
+            return field_value
+        elif isinstance(field_value, str):
+            return [field_value.strip()] if field_value.strip() else []
+        elif field_value is None:
+            return []
+        else:
+            logger.warning(f"Invalid field type {type(field_value)} for value {field_value}, converting to empty list")
+            return []
+
+    def collect_categories(self, item: Dict, parent_code: str = None, seen_codes: set = None, level: str = 'category') -> List[Dict]:
         if seen_codes is None:
             seen_codes = set()
 
         records = []
         code = item.get("code", "").strip()
         if not code:
-            logger.warning("Empty code provided, skipping")
+            logger.warning(f"Empty code provided at level {level}, skipping")
             return records
 
-        # Initialize record for the current category
+        # Log raw item for debugging, especially for code "I"
+        if code == "I":
+            logger.debug(f"Raw JSON entry for code I at level {level}: {item}")
+
+        # Normalize inclusions and exclusions
+        inclusions = self.normalize_field(item.get("inclusions"))
+        exclusions = self.normalize_field(item.get("exclusions"))
+
         record = {
             "code": code,
-            "title": item.get("title", "No title provided"),
+            "title": item.get("title", f"ICD Code {code}"),
             "definition": item.get("definition", ""),
-            "inclusions": item.get("inclusions", []),
-            "exclusions": item.get("exclusions", []),
+            "inclusions": inclusions,
+            "exclusions": exclusions,
             "parent_code": parent_code,
             "is_range": False
         }
 
-        # Handle code ranges
+        # Log the processed record
+        logger.debug(f"Processed record for code {code} at level {level}: {record}")
+
+        # Handle range codes (e.g., A00-A09, U82-U85)
         if '-' in code and re.match(r'[A-Za-z]+\d+-[A-Za-z]+\d+', code):
             record["is_range"] = True
             if code not in seen_codes:
                 records.append(record)
                 seen_codes.add(code)
+            else:
+                logger.warning(f"Duplicate code {code} at level {level}: {record}, skipping")
 
-            expanded_codes = self.expand_range(code, record["title"])
+            expanded_codes = self.expand_range(code, record["title"], record["inclusions"], record["exclusions"])
             if len(expanded_codes) > 1:
                 for exp_code, exp_title, exp_inclusions, exp_exclusions in expanded_codes:
                     if exp_code not in seen_codes:
@@ -102,37 +124,31 @@ class Command(BaseCommand):
                         })
                         seen_codes.add(exp_code)
                     else:
-                        logger.warning(f"Duplicate code {exp_code} from range {code}, skipping")
+                        logger.warning(f"Duplicate code {exp_code} from range {code} at level {level}: {record}, skipping")
         else:
-            # Prioritize standalone entries
             if code not in seen_codes:
                 records.append(record)
                 seen_codes.add(code)
             else:
-                # Update existing record if standalone has more specific data
-                for existing in records:
-                    if existing["code"] == code and existing["is_range"]:
-                        existing.update({
-                            "title": record["title"],
-                            "definition": record["definition"],
-                            "inclusions": record["inclusions"],
-                            "exclusions": record["exclusions"],
-                            "parent_code": record["parent_code"],
-                            "is_range": False
-                        })
-                        logger.info(f"Updated code {code} with standalone data")
-                        break
-                else:
-                    logger.warning(f"Duplicate code {code} as standalone, skipping")
+                logger.warning(f"Duplicate code {code} at level {level}: {record}, skipping")
 
-        # Process subcategories
-        for sub_item in item.get("subcategories", []) + item.get("sub_subcategories", []) + item.get("codes", []):
-            records.extend(self.collect_categories(sub_item, parent_code=code, seen_codes=seen_codes))
+        # Process subcategories or codes based on level
+        if level == 'category':
+            sub_items = item.get("subcategories", [])
+            next_level = 'subcategory'
+        elif level == 'subcategory':
+            sub_items = item.get("sub_subcategories", []) or item.get("codes", [])
+            next_level = 'sub_subcategory'
+        else:
+            sub_items = item.get("codes", [])
+            next_level = 'code'
+
+        for sub_item in sub_items:
+            records.extend(self.collect_categories(sub_item, parent_code=code, seen_codes=seen_codes, level=next_level))
 
         return records
 
     def create_icd_category(self, record: Dict):
-        """Create or update an ICDCategory from a record."""
         code = record["code"]
         parent_code = record["parent_code"]
         parent = None
@@ -141,10 +157,18 @@ class Command(BaseCommand):
             try:
                 parent = ICDCategory.objects.get(code=parent_code)
             except ICDCategory.DoesNotExist:
-                logger.error(f"Parent code {parent_code} does not exist for {code}")
-                raise ICDCategoryCreationError(f"Parent code {parent_code} does not exist for {code}")
+                logger.warning(f"Parent code {parent_code} does not exist for {code}, setting parent to None")
+                parent = None
 
         try:
+            # Validate fields before serialization
+            if not isinstance(record["inclusions"], list):
+                logger.error(f"Invalid inclusions for code {code}: {record['inclusions']}")
+                raise ValueError(f"Inclusions for code {code} must be a list")
+            if not isinstance(record["exclusions"], list):
+                logger.error(f"Invalid exclusions for code {code}: {record['exclusions']}")
+                raise ValueError(f"Exclusions for code {code} must be a list")
+
             icd_entry, created = ICDCategory.objects.get_or_create(
                 code=code,
                 defaults={
@@ -156,7 +180,6 @@ class Command(BaseCommand):
                 }
             )
             if not created:
-                # Update existing record
                 icd_entry.title = record["title"]
                 icd_entry.definition = record["definition"]
                 icd_entry.parent = parent
@@ -171,8 +194,6 @@ class Command(BaseCommand):
             raise ICDCategoryCreationError(f"Failed to create ICDCategory for code {code}: {str(e)}")
 
     def handle(self, *args, **options):
-        """Handle the command execution."""
-        # Configure logging to avoid duplicates
         logger.handlers = [logging.StreamHandler()]
         logger.setLevel(logging.DEBUG)
 
@@ -202,26 +223,27 @@ class Command(BaseCommand):
             ICDCategory.objects.all().delete()
             self.stdout.write("Cleared existing ICDCategory data")
 
-        # Collect all categories
-        categories = data.get("categories", data.get("codes", []))
+        categories = data.get("categories", [])
+        if not categories:
+            logger.error("No categories found in JSON data")
+            self.stdout.write(self.style.ERROR("No categories found in JSON data"))
+            raise JSONFileLoadError("No categories found in JSON data")
+
         all_records = []
         for category in categories:
-            all_records.extend(self.collect_categories(category))
+            all_records.extend(self.collect_categories(category, level='category'))
 
-        # Temporarily disable foreign key checks
         with connection.cursor() as cursor:
             cursor.execute('PRAGMA foreign_keys = OFF;')
 
         try:
             with transaction.atomic():
-                # Create all records
                 for record in all_records:
                     self.create_icd_category(record)
         except Exception as e:
             logger.error(f"Failed to load ICD data: {str(e)}", exc_info=True)
             raise
         finally:
-            # Re-enable foreign key checks and validate
             with connection.cursor() as cursor:
                 cursor.execute('PRAGMA foreign_keys = ON;')
                 cursor.execute('PRAGMA foreign_key_check;')

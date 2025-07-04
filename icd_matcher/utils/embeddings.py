@@ -10,11 +10,21 @@ from icd_matcher.utils.knowledge_graph import KnowledgeGraph
 from icd_matcher.utils.db_utils import execute_fts_query, get_icd_title
 import hashlib
 from asgiref.sync import sync_to_async
+import re
 
 logger = logging.getLogger(__name__)
 
 class EmbedderSingleton:
     _instance = None
+    _abbreviation_dict = {
+        'b/l': 'bilateral',
+        'inv': 'investigation',
+        'htn': 'hypertension',
+        'dm': 'diabetes mellitus',
+        'cad': 'coronary artery disease',
+        'copd': 'chronic obstructive pulmonary disease',
+        'mi': 'myocardial infarction',
+    }
 
     @classmethod
     def get_instance(cls):
@@ -26,6 +36,12 @@ class EmbedderSingleton:
                 cls._instance = SentenceTransformer('paraphrase-MiniLM-L6-v2')
         return cls._instance
 
+    @classmethod
+    def expand_abbreviations(cls, text: str) -> str:
+        for abbr, full in cls._abbreviation_dict.items():
+            text = re.sub(rf'\b{re.escape(abbr)}\b', full, text, flags=re.IGNORECASE)
+        return text
+
 async def get_sentence_embedder():
     try:
         return EmbedderSingleton.get_instance()
@@ -33,8 +49,8 @@ async def get_sentence_embedder():
         logger.error(f"Error accessing embedder: {e}")
         raise ValueError(f"Error accessing embedder: {e}")
 
-async def get_title_embedding(title: str) -> np.ndarray:
-    title_hash = hashlib.sha256(title[:1000].encode()).hexdigest()
+async def get_title_embedding(title: str, context: str = None) -> np.ndarray:
+    title_hash = hashlib.sha256((title + (context or ''))[:1000].encode()).hexdigest()
     cache_key = f"title_embedding_{title_hash}_v1"
     cached_embedding = await sync_to_async(cache.get)(cache_key)
     if cached_embedding is not None:
@@ -43,7 +59,11 @@ async def get_title_embedding(title: str) -> np.ndarray:
 
     try:
         embedder = await get_sentence_embedder()
-        embedding = embedder.encode(title.lower(), convert_to_numpy=True, normalize_embeddings=True)
+        text_to_embed = await preprocess_text(EmbedderSingleton.expand_abbreviations(title.lower()))
+        if context:
+            context = await preprocess_text(EmbedderSingleton.expand_abbreviations(context.lower()))
+            text_to_embed = f"{text_to_embed} [CONTEXT] {context}"
+        embedding = embedder.encode(text_to_embed, convert_to_numpy=True, normalize_embeddings=True)
         await sync_to_async(cache.set)(cache_key, embedding, timeout=settings.ICD_MATCHING_SETTINGS.get('CACHE_TTL', 3600))
         logger.debug(f"Cached title embedding for: {title}")
         return embedding
@@ -51,7 +71,7 @@ async def get_title_embedding(title: str) -> np.ndarray:
         logger.error(f"Failed to generate embedding for title '{title}': {e}")
         raise ValueError(f"Embedding generation failed for title '{title}': {e}")
 
-async def batch_encode_texts(texts: List[str], batch_size: int = None) -> np.ndarray:
+async def batch_encode_texts(texts: List[str], context: str = None, batch_size: int = None) -> np.ndarray:
     if not texts:
         logger.warning("Empty text list provided for batch encoding")
         return np.array([])
@@ -64,7 +84,10 @@ async def batch_encode_texts(texts: List[str], batch_size: int = None) -> np.nda
     try:
         for i in range(0, len(texts), batch_size):
             batch = texts[i:i + batch_size]
-            batch = [text if isinstance(text, str) else "" for text in batch]
+            batch = [await preprocess_text(EmbedderSingleton.expand_abbreviations(text)) if isinstance(text, str) else "" for text in batch]
+            if context:
+                context = await preprocess_text(EmbedderSingleton.expand_abbreviations(context))
+                batch = [f"{text} [CONTEXT] {context}" for text in batch]
             if not batch:
                 continue
             batch_embeddings = embedder.encode(
@@ -79,13 +102,12 @@ async def batch_encode_texts(texts: List[str], batch_size: int = None) -> np.nda
         raise ValueError(f"Batch encoding failed: {e}")
 
 async def find_best_icd_match(conditions: List[str], patient_text: str) -> Dict[str, List[Tuple[str, str, float]]]:
-    """Find the best ICD code matches for given conditions."""
     try:
         model = await get_sentence_embedder()
         icd_matches = {}
 
         for condition in conditions:
-            norm_cond = condition.lower().strip()
+            norm_cond = await preprocess_text(condition.lower().strip())
             logger.debug(f"Processing condition: {norm_cond}")
 
             fts_results = await execute_fts_query(norm_cond, limit=30)
@@ -100,8 +122,8 @@ async def find_best_icd_match(conditions: List[str], patient_text: str) -> Dict[
             candidate_codes = [item['code'] for item in fts_results]
 
             try:
-                condition_embedding = model.encode([norm_cond], convert_to_numpy=True)
-                candidate_embeddings = await batch_encode_texts(candidate_texts)
+                condition_embedding = await batch_encode_texts([norm_cond], context=patient_text)
+                candidate_embeddings = await batch_encode_texts(candidate_texts, context=patient_text)
 
                 similarities = np.dot(condition_embedding, candidate_embeddings.T).flatten()
                 similarities = similarities / (

@@ -13,6 +13,8 @@ from icd_matcher.utils.exceptions import ICDPipelineError
 from celery import group
 import hashlib
 
+from icd_matcher_project import celery
+
 logger = logging.getLogger(__name__)
 
 def stream_csv(data: AsyncIterable[list]) -> AsyncIterable[bytes]:
