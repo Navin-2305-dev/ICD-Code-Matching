@@ -5,6 +5,9 @@ import json
 import django
 from datetime import datetime, timedelta
 from decouple import config
+import logging
+
+logger = logging.getLogger(__name__)
 
 # Add project root to sys.path
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -18,15 +21,17 @@ from icd_matcher.models import MedicalAdmissionDetails
 
 def inspect_redis():
     try:
-        # Connect to Redis
-        r = redis.Redis(
+        # Connect to Redis with connection pooling
+        pool = redis.ConnectionPool(
             host=config('REDIS_HOST', default='localhost'),
             port=config('REDIS_PORT', cast=int, default=6379),
             db=config('REDIS_DB', cast=int, default=0),
             decode_responses=True,
-            password=config('REDIS_PASSWORD', default=None)
+            password=config('REDIS_PASSWORD', default=None),
+            max_connections=10
         )
-        print("Connected to Redis")
+        r = redis.Redis(connection_pool=pool)
+        logger.info("Connected to Redis")
 
         # List all keys
         print("\nAll Redis keys:")
@@ -46,6 +51,7 @@ def inspect_redis():
                 decoded = json.loads(item)
                 print(f"Task {i}: {json.dumps(decoded, indent=2)}")
             except json.JSONDecodeError:
+                logger.warning(f"Failed to parse queue item {i}: {item}")
                 print(f"Task {i}: (Unparseable) {item}")
 
         # Inspect task results
@@ -64,7 +70,6 @@ def inspect_redis():
                 print(json.dumps(decoded, indent=2))
                 ttl = r.ttl(key)
                 print(f"TTL: {ttl} seconds")
-                # Correlate with database
                 task_id = decoded.get('task_id')
                 if not task_id:
                     print("No task_id available for correlation")
@@ -86,16 +91,22 @@ def inspect_redis():
                         else:
                             print("No related database records found")
                     except ValueError as e:
+                        logger.error(f"Error parsing date_done: {e}")
                         print(f"Error parsing date_done: {e}")
                 else:
                     print("No date_done available for correlation")
             except json.JSONDecodeError:
+                logger.warning(f"Failed to parse task result {key}: {result}")
                 print(f"{key}: (Unparseable) {result}")
-
     except redis.ConnectionError as e:
+        logger.error(f"Redis connection failed: {e}")
         print(f"Redis connection failed: {e}")
     except Exception as e:
+        logger.error(f"Error inspecting Redis: {e}")
         print(f"Error: {e}")
+    finally:
+        if 'r' in locals():
+            r.close()
 
 if __name__ == "__main__":
     inspect_redis()
